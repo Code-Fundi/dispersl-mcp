@@ -3,5 +3,5 @@
   "include": ["src/FastMCP.ts", "src/bin/fastmcp.ts"],
   "license": "MIT",
   "name": "@punkpeye/fastmcp",
-  "version": "1.0.0"
+  "version": "0.1.0"
 }
