@@ -1,4 +1,4 @@
-# DisperslMCP
+# Dispersl MCP
 
 A Model Context Protocol (MCP) server for DisperslAPI integration. This server can act as both a server and client, connecting to other MCP servers and executing their tools. It manages sessions and executes tools in a loop until an `end_session` tool is called or streaming multipart/string content is used via a chat endpoint.
 
@@ -16,6 +16,11 @@ A Model Context Protocol (MCP) server for DisperslAPI integration. This server c
 
 ## Installation
 
+#### Cursor
+
+<a href="https://cursor.com/install-mcp?name=dispersl&config=eyJjb21tYW5kIjoibnB4IC15IEBjb2RlZnVuZGkvZGlzcGVyc2wtbWNwIHBrX2xpdmVfc2NlY2VjYWVlaW5sbmozMmxuZmo5OSJ9"><img src="https://cursor.com/deeplink/mcp-install-dark.svg" alt="Add dispersl MCP server to Cursor" height="32" /></a>
+
+#### Node
 ```bash
 npm install dispersl-mcp
 ```
@@ -164,7 +169,7 @@ await client.callTool({
     name: "my-server",
     command: "node",
     args: ["dist/server.js"],
-    env: { PORT: "8081" }
+    env: { PORT: "8080" }
   }
 });
 ```

@@ -224,8 +224,22 @@ export interface MCPServerConfig {
   tools?: string[];
 }
 
+export type MCPHttpConfig =
+  | {
+      type: 'streamable-http';
+      url: string;
+      env?: Record<string, string>;
+      note?: string;
+    }
+  | {
+      type: 'sse';
+      url: string;
+      env?: Record<string, string>;
+      note?: string;
+    };
+
 export interface MCPConfig {
-  servers: MCPServerConfig[];
+  mcpServers: Record<string, MCPClientConfig | MCPHttpConfig>;
 }
 
 // Error Classes

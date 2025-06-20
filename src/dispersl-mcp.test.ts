@@ -10,21 +10,22 @@ describe("DisperslMCPServer", () => {
   beforeAll(async () => {
     // Start the server
     server = new DisperslMCPServer();
-    await server.start(8081); // Use a different port for testing
+    await server.start(8080); // Use a different port for testing
 
     // Create a client to connect to the server
     const transport = new StdioClientTransport({
       command: "node",
       args: ["dist/server.js"],
-      env: { PORT: "8081" }
+      env: { PORT: "8080" }
     });
 
     client = new Client({
       name: "test-client",
+      version: "0.1.0",
       transport
     });
 
-    await client.connect();
+    await client.connect(transport);
   });
 
   afterAll(async () => {
@@ -40,12 +41,13 @@ describe("DisperslMCPServer", () => {
 
       expect(response.status).toBe("success");
       expect(response.models).toBeDefined();
-      expect(response.models.length).toBeGreaterThan(0);
-      expect(response.models[0]).toHaveProperty("id");
-      expect(response.models[0]).toHaveProperty("name");
-      expect(response.models[0]).toHaveProperty("description");
-      expect(response.models[0]).toHaveProperty("context_length");
-      expect(response.models[0]).toHaveProperty("tier_requirements");
+      const models = response.models as any[];
+      expect(models.length).toBeGreaterThan(0);
+      expect(models[0]).toHaveProperty("id");
+      expect(models[0]).toHaveProperty("name");
+      expect(models[0]).toHaveProperty("description");
+      expect(models[0]).toHaveProperty("context_length");
+      expect(models[0]).toHaveProperty("tier_requirements");
     });
   });
 
@@ -210,9 +212,10 @@ describe("DisperslMCPServer", () => {
 
       expect(getResponse.status).toBe("success");
       expect(getResponse.conversation).toBeDefined();
-      expect(getResponse.conversation?.id).toBe("test-conversation");
-      expect(getResponse.conversation?.messages).toBeDefined();
-      expect(Array.isArray(getResponse.conversation?.messages)).toBe(true);
+      const conversation = getResponse.conversation as any;
+      expect(conversation?.id).toBe("test-conversation");
+      expect(conversation?.messages).toBeDefined();
+      expect(Array.isArray(conversation?.messages)).toBe(true);
 
       // End the session
       await client.callTool({
