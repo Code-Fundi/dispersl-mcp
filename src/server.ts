@@ -40,6 +40,7 @@ import {
 import { v4 as uuidv4 } from "uuid";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { ZodType } from "zod";
+import { EventSource } from "eventsource";
 
 const execAsync = async (command: string, args?: string[]) => {
   const { stdout, stderr } = await execa(command, args);
@@ -71,32 +72,6 @@ interface ToolResponse {
   output: string;
 }
 
-// Multipart Response Processing
-async function processMultipartResponse(
-  response: any,
-  options: {
-    onTextContent?: (text: string) => void;
-    onKnowledgeRetrieved?: (knowledge: string) => Promise<void>;
-    onToolCall?: (toolData: Record<string, unknown>) => Promise<void>;
-    onStreamUpdate?: (fullResponse: string) => void;
-  }
-): Promise<string> {
-  let fullResponse = '';
-  const { onTextContent, onKnowledgeRetrieved, onToolCall, onStreamUpdate } = options;
-
-  if (response.type === 'text' && response.content) {
-    fullResponse += response.content;
-    onTextContent?.(response.content);
-  } else if (response.type === 'knowledge' && response.knowledge) {
-    await onKnowledgeRetrieved?.(response.knowledge);
-  } else if (response.type === 'tool' && response.tool) {
-    await onToolCall?.(response.tool);
-  }
-
-  onStreamUpdate?.(fullResponse);
-  return fullResponse;
-}
-
 // Main Server Class
 export class DisperslMCPServer {
   private server: FastMCP;
@@ -106,10 +81,26 @@ export class DisperslMCPServer {
   private mcpConfigPath: string;
   private tools: Map<string, MCPTool>;
   private apiKey?: string;
+  private chatModel?: string | null;
+  private planModel?: string | null;
+  private coderModel?: string | null;
+  private testerModel?: string | null;
+  private gitModel?: string | null;
+  private docsModel?: string | null;
+  private mcpTools: Array<{ name: string; description: string; parameters: any }> = [];
 
   constructor(apiKey?: string) {
     // Get API key from argument or environment variable
     this.apiKey = apiKey || process.env.DISPERSL_API_KEY;
+
+    // Get default models from argument or environment variable
+    this.chatModel = process.env.DISPERSL_CHAT_MODEL || null;
+    this.planModel = process.env.DISPERSL_PLAN_MODEL || null;
+    this.coderModel = process.env.DISPERSL_CODE_MODEL || null;
+    this.testerModel = process.env.DISPERSL_TEST_MODEL || null;
+    this.gitModel = process.env.DISPERSL_GIT_MODEL || null;
+    this.docsModel = process.env.DISPERSL_DOCS_MODEL || null;
+
     this.server = new FastMCP({
       name: "dispersl-mcp",
       version: "0.1.0",
@@ -174,19 +165,19 @@ export class DisperslMCPServer {
 
     // Code Generation
     const buildCodeTool: MCPTool = {
-      name: "build_code",
-      description: "Generate code based on a prompt using agentic execution",
+      name: "dispersl_code_agent",
+      description: "Generate code files and codebases based on a prompt using agentic execution",
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
         context: z.string().optional(),
-        conversation_id: z.string().optional(),
+        task_id: z.string().optional(),
         knowledge: z.string().optional(),
         mcp: z.record(z.unknown()).optional()
       }),
       execute: async (args: unknown) => {
         const req = args as BuildCodeRequest;
-        const sessionId = req.conversation_id || uuidv4();
+        const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
@@ -196,18 +187,28 @@ export class DisperslMCPServer {
             active_tools: new Set()
           });
         }
+        // Set default model if not provided
+        if (!req.model && this.coderModel) {
+          req.model = this.coderModel;
+        }
         const session = this.sessions.get(sessionId)!;
         try {
-          await this.executeDisperslAgent("/build/code", req, session);
-          const tool = session.tools.get("build_code");
-          const content = tool?.lastResponse?.content;
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/agent/code", req, session);
+          let fullResponse = '';
+          for await (const chunk of stream) {
+            if (chunk.content) fullResponse += chunk.content;
+          }
+          session.tools.set("dispersl_code_agent", {
+            name: "dispersl_code_agent",
+            description: buildCodeTool.description,
+            parameters: buildCodeTool.parameters,
+            execute: async () => fullResponse,
+            lastResponse: { content: fullResponse }
+          });
           return {
             type: "text",
-            text: typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map(c => typeof c === "string" ? c : (c.type === "text" ? c.text : "")).join("")
-                : "Code generation completed"
+            text: fullResponse || "Code generation completed"
           };
         } catch (error) {
           return {
@@ -238,19 +239,19 @@ export class DisperslMCPServer {
 
     // Test Generation
     const buildTestsTool: MCPTool = {
-      name: "build_tests",
-      description: "Generate tests based on a prompt using agentic execution",
+      name: "dispersl_testing_agent",
+      description: "Generate end to end tests based on a prompt using agentic execution",
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
         context: z.string().optional(),
-        conversation_id: z.string().optional(),
+        task_id: z.string().optional(),
         knowledge: z.string().optional(),
         mcp: z.record(z.unknown()).optional()
       }),
       execute: async (args: unknown) => {
         const req = args as BuildTestsRequest;
-        const sessionId = req.conversation_id || uuidv4();
+        const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
@@ -260,18 +261,28 @@ export class DisperslMCPServer {
             active_tools: new Set()
           });
         }
+        // Set default model if not provided
+        if (!req.model && this.testerModel) {
+          req.model = this.testerModel;
+        }
         const session = this.sessions.get(sessionId)!;
         try {
-          await this.executeDisperslAgent("/build/tests", req, session);
-          const lastResponse = session.tools.get("build_tests")?.lastResponse;
-          const content = lastResponse?.content;
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/agent/tests", req, session);
+          let fullResponse = '';
+          for await (const chunk of stream) {
+            if (chunk.content) fullResponse += chunk.content;
+          }
+          session.tools.set("dispersl_testing_agent", {
+            name: "dispersl_testing_agent",
+            description: buildTestsTool.description,
+            parameters: buildTestsTool.parameters,
+            execute: async () => fullResponse,
+            lastResponse: { content: fullResponse }
+          });
           return {
             type: "text",
-            text: typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map(c => typeof c === "string" ? c : (c.type === "text" ? c.text : "")).join("")
-                : "Test generation completed"
+            text: fullResponse || "Test generation completed"
           };
         } catch (error) {
           return {
@@ -302,19 +313,19 @@ export class DisperslMCPServer {
 
     // Git Operations
     const gitOperationTool: MCPTool = {
-      name: "git_operation",
-      description: "Execute Git operations based on a prompt using agentic execution",
+      name: "dispersl_git_agent",
+      description: "Execute codebase versioning operations with Git based on a prompt using agentic execution",
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
         context: z.string().optional(),
-        conversation_id: z.string().optional(),
+        task_id: z.string().optional(),
         knowledge: z.string().optional(),
         mcp: z.record(z.unknown()).optional()
       }),
       execute: async (args: unknown) => {
         const req = args as GitOperationRequest;
-        const sessionId = req.conversation_id || uuidv4();
+        const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
@@ -324,18 +335,28 @@ export class DisperslMCPServer {
             active_tools: new Set()
           });
         }
+        // Set default model if not provided
+        if (!req.model && this.gitModel) {
+          req.model = this.gitModel;
+        }
         const session = this.sessions.get(sessionId)!;
         try {
-          await this.executeDisperslAgent("/build/git", req, session);
-          const lastResponse = session.tools.get("git_operation")?.lastResponse;
-          const content = lastResponse?.content;
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/agent/git", req, session);
+          let fullResponse = '';
+          for await (const chunk of stream) {
+            if (chunk.content) fullResponse += chunk.content;
+          }
+          session.tools.set("dispersl_git_agent", {
+            name: "dispersl_git_agent",
+            description: gitOperationTool.description,
+            parameters: gitOperationTool.parameters,
+            execute: async () => fullResponse,
+            lastResponse: { content: fullResponse }
+          });
           return {
             type: "text",
-            text: typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map(c => typeof c === "string" ? c : (c.type === "text" ? c.text : "")).join("")
-                : "Git operation completed"
+            text: fullResponse || "Git operation completed"
           };
         } catch (error) {
           return {
@@ -366,21 +387,21 @@ export class DisperslMCPServer {
 
     // Documentation Generation
     const generateDocsTool: MCPTool = {
-      name: "generate_docs",
-      description: "Generate documentation for a repository using agentic execution",
+      name: "dispersl_new_docs_agent",
+      description: "Generate file by file technical documentation for a code repository using agentic execution",
       parameters: z.object({
         url: z.string(),
         branch: z.string().optional(),
         team_access: z.boolean().optional(),
         model: z.string().optional(),
         context: z.string().optional(),
-        conversation_id: z.string().optional(),
+        task_id: z.string().optional(),
         knowledge: z.string().optional(),
         mcp: z.record(z.unknown()).optional()
       }),
       execute: async (args: unknown) => {
         const req = args as GenerateDocsRequest;
-        const sessionId = req.conversation_id || uuidv4();
+        const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
@@ -390,18 +411,28 @@ export class DisperslMCPServer {
             active_tools: new Set()
           });
         }
+        // Set default model if not provided
+        if (!req.model && this.docsModel) {
+          req.model = this.docsModel;
+        }
         const session = this.sessions.get(sessionId)!;
         try {
-          await this.executeDisperslAgent("/docs/repo", req, session);
-          const lastResponse = session.tools.get("generate_docs")?.lastResponse;
-          const content = lastResponse?.content;
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/docs/repo", req, session);
+          let fullResponse = '';
+          for await (const chunk of stream) {
+            if (chunk.content) fullResponse += chunk.content;
+          }
+          session.tools.set("dispersl_new_docs_agent", {
+            name: "dispersl_new_docs_agent",
+            description: generateDocsTool.description,
+            parameters: generateDocsTool.parameters,
+            execute: async () => fullResponse,
+            lastResponse: { content: fullResponse }
+          });
           return {
             type: "text",
-            text: typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map(c => typeof c === "string" ? c : (c.type === "text" ? c.text : "")).join("")
-                : "Documentation generation completed"
+            text: fullResponse || "Documentation generation completed"
           };
         } catch (error) {
           return {
@@ -432,13 +463,13 @@ export class DisperslMCPServer {
 
     // Chat
     const chatTool: MCPTool = {
-      name: "chat",
-      description: "Chat with the agent using agentic execution",
+      name: "dispersl_chat_agent",
+      description: "Chat with the Dispersl agent to get knowledge or insights about codebases using agentic execution",
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
         context: z.string().optional(),
-        conversation_id: z.string().optional(),
+        task_id: z.string().optional(),
         knowledge: z.string().optional(),
         memory: z.boolean().optional(),
         voice: z.boolean().optional(),
@@ -446,7 +477,7 @@ export class DisperslMCPServer {
       }),
       execute: async (args: unknown) => {
         const req = args as ChatRequest;
-        const sessionId = req.conversation_id || uuidv4();
+        const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
@@ -456,6 +487,10 @@ export class DisperslMCPServer {
             active_tools: new Set()
           });
         }
+        // Set default model if not provided
+        if (!req.model && this.chatModel) {
+          req.model = this.chatModel;
+        }
         const session = this.sessions.get(sessionId)!;
         try {
           session.conversation_history.push({
@@ -463,10 +498,11 @@ export class DisperslMCPServer {
             content: req.prompt,
             timestamp: new Date().toISOString()
           });
-          const stream = await this.executeDisperslStream("/chat", req, session);
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/agent/chat", req, session);
           let fullResponse = '';
           for await (const chunk of stream) {
-            fullResponse += chunk;
+            if (chunk.content) fullResponse += chunk.content;
           }
           return {
             type: "text",
@@ -607,7 +643,7 @@ export class DisperslMCPServer {
         return JSON.stringify(result);
       }
     });
-    this.tools.set(addMCPClientTool.name, addMCPClientTool);;
+    this.tools.set(addMCPClientTool.name, addMCPClientTool);
 
     // Add method to remove MCP server
     const removeMCPServerTool: MCPTool = {
@@ -662,6 +698,901 @@ export class DisperslMCPServer {
       }
     });
     this.tools.set(removeMCPServerTool.name, removeMCPServerTool);    
+
+    // Models
+    const getModelsTool: MCPTool = {
+      name: "get_models",
+      description: "List available AI models",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/models", "GET");
+          return { type: "text", text: JSON.stringify(result) };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getModelsTool.name,
+      description: getModelsTool.description,
+      parameters: getModelsTool.parameters as any,
+      execute: async (args: unknown, _context: any): Promise<any> => {
+        const result = await getModelsTool.execute(args);
+        if (result && typeof result === "object" && "type" in result && result.type === "data") {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (result && typeof result === "object" && "text" in result) {
+          if (!('type' in result)) {
+            return { ...(result as any), type: "text" } as import("./types.js").TextContent;
+          }
+          return result as import("./types.js").TextContent;
+        }
+        return result;
+      }
+    });
+    this.tools.set(getModelsTool.name, getModelsTool);
+
+    // API Keys
+    const getKeysTool: MCPTool = {
+      name: "get_keys",
+      description: "Get API keys for the authenticated user",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/keys", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getKeysTool.name,
+      description: getKeysTool.description,
+      parameters: getKeysTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getKeysTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getKeysTool.name, getKeysTool);
+
+    const newKeyTool: MCPTool = {
+      name: "new_key",
+      description: "Generate new API key",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/keys/new", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: newKeyTool.name,
+      description: newKeyTool.description,
+      parameters: newKeyTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await newKeyTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(newKeyTool.name, newKeyTool);
+
+    // Tasks
+    const createTaskTool: MCPTool = {
+      name: "create_task",
+      description: "Create a new task",
+      parameters: z.object({ body: z.object({}).passthrough() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint("/tasks/new", "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: createTaskTool.name,
+      description: createTaskTool.description,
+      parameters: createTaskTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await createTaskTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(createTaskTool.name, createTaskTool);
+
+    const editTaskTool: MCPTool = {
+      name: "edit_task",
+      description: "Edit a task by ID",
+      parameters: z.object({ id: z.string(), body: z.object({}).passthrough() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/tasks/${args.id}/edit`, "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: editTaskTool.name,
+      description: editTaskTool.description,
+      parameters: editTaskTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await editTaskTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(editTaskTool.name, editTaskTool);
+
+    const getTasksTool: MCPTool = {
+      name: "get_tasks",
+      description: "Get all tasks",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/tasks", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getTasksTool.name,
+      description: getTasksTool.description,
+      parameters: getTasksTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getTasksTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getTasksTool.name, getTasksTool);
+
+    const getTaskTool: MCPTool = {
+      name: "get_task",
+      description: "Get a task by ID",
+      parameters: z.object({ id: z.string() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/tasks/${args.id}`, "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getTaskTool.name,
+      description: getTaskTool.description,
+      parameters: getTaskTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getTaskTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getTaskTool.name, getTaskTool);
+
+    const deleteTaskTool: MCPTool = {
+      name: "cancel_task",
+      description: "Cancel a task by ID",
+      parameters: z.object({ id: z.string() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/tasks/${args.id}/cancel`, "DELETE");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: deleteTaskTool.name,
+      description: deleteTaskTool.description,
+      parameters: deleteTaskTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await deleteTaskTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(deleteTaskTool.name, deleteTaskTool);
+
+    // Steps
+    const editStepTool: MCPTool = {
+      name: "edit_step",
+      description: "Edit a step by ID",
+      parameters: z.object({ id: z.string(), body: z.object({}).passthrough() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/steps/${args.id}/edit`, "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: editStepTool.name,
+      description: editStepTool.description,
+      parameters: editStepTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await editStepTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(editStepTool.name, editStepTool);
+
+    const getStepsTool: MCPTool = {
+      name: "get_steps",
+      description: "Get all steps",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/steps", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getStepsTool.name,
+      description: getStepsTool.description,
+      parameters: getStepsTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getStepsTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getStepsTool.name, getStepsTool);
+
+    const getStepTool: MCPTool = {
+      name: "get_step",
+      description: "Get a step by ID",
+      parameters: z.object({ id: z.string() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/steps/${args.id}`, "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getStepTool.name,
+      description: getStepTool.description,
+      parameters: getStepTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getStepTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getStepTool.name, getStepTool);
+
+    const deleteStepTool: MCPTool = {
+      name: "cancel_step",
+      description: "Cancel a step by ID",
+      parameters: z.object({ id: z.string() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/steps/${args.id}/cancel`, "DELETE");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: deleteStepTool.name,
+      description: deleteStepTool.description,
+      parameters: deleteStepTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await deleteStepTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(deleteStepTool.name, deleteStepTool);
+
+    // Stats
+    const getUsageStatsTool: MCPTool = {
+      name: "get_usage_stats",
+      description: "Get usage stats",
+      parameters: z.object({ body: z.object({}).passthrough().optional() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint("/stats/usage", "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getUsageStatsTool.name,
+      description: getUsageStatsTool.description,
+      parameters: getUsageStatsTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getUsageStatsTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getUsageStatsTool.name, getUsageStatsTool);
+
+    const getLanguageStatsTool: MCPTool = {
+      name: "get_language_stats",
+      description: "Get language usage stats",
+      parameters: z.object({ body: z.object({}).passthrough().optional() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint("/stats/language", "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getLanguageStatsTool.name,
+      description: getLanguageStatsTool.description,
+      parameters: getLanguageStatsTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getLanguageStatsTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getLanguageStatsTool.name, getLanguageStatsTool);
+
+    const getAgentStatsTool: MCPTool = {
+      name: "get_agent_stats",
+      description: "Get agent query stats",
+      parameters: z.object({ body: z.object({}).passthrough().optional() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint("/stats/agent", "POST", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getAgentStatsTool.name,
+      description: getAgentStatsTool.description,
+      parameters: getAgentStatsTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getAgentStatsTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getAgentStatsTool.name, getAgentStatsTool);
+
+    // History
+    const getTaskHistoryTool: MCPTool = {
+      name: "get_task_history",
+      description: "Get task history by ID",
+      parameters: z.object({ id: z.string(), body: z.object({}).passthrough().optional() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/history/${args.id}`, "GET", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getTaskHistoryTool.name,
+      description: getTaskHistoryTool.description,
+      parameters: getTaskHistoryTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getTaskHistoryTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getTaskHistoryTool.name, getTaskHistoryTool);
+
+    const getStepHistoryTool: MCPTool = {
+      name: "get_step_history",
+      description: "Get step history by ID",
+      parameters: z.object({ id: z.string(), body: z.object({}).passthrough().optional() }),
+      execute: async (args: any) => {
+        try {
+          const result = await this.callJsonEndpoint(`/history/${args.id}/step`, "GET", args.body);
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getStepHistoryTool.name,
+      description: getStepHistoryTool.description,
+      parameters: getStepHistoryTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getStepHistoryTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getStepHistoryTool.name, getStepHistoryTool);
+
+    // Fetch & Health
+    const fetchApiRootTool: MCPTool = {
+      name: "fetch_api_root",
+      description: "Fetch API root (utility endpoint)",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/fetch", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: fetchApiRootTool.name,
+      description: fetchApiRootTool.description,
+      parameters: fetchApiRootTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await fetchApiRootTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(fetchApiRootTool.name, fetchApiRootTool);
+
+    const healthCheckTool: MCPTool = {
+      name: "health_check",
+      description: "Health check endpoint",
+      parameters: z.object({}),
+      execute: async () => {
+        try {
+          const result = await this.callJsonEndpoint("/health", "GET");
+          return { type: "data", data: result };
+        } catch (error) {
+          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+        }
+      }
+    };
+    this.server.addTool({
+      name: healthCheckTool.name,
+      description: healthCheckTool.description,
+      parameters: healthCheckTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await healthCheckTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(healthCheckTool.name, healthCheckTool);
+
+    // Remove the new *_agentic tools if present (and do not add them)
+    this.tools.delete("plan_agentic");
+    this.tools.delete("build_code_agentic");
+    this.tools.delete("build_tests_agentic");
+    this.tools.delete("build_git_agentic");
+    this.tools.delete("generate_docs_agentic");
+    this.tools.delete("chat_agentic");
+
+    // Plan Agent
+    const planTool: MCPTool = {
+      name: "dispersl_plan_agent",
+      description: "Multi-agent task dispersion using agentic execution (plan agent)",
+      parameters: z.object({
+        prompt: z.string(),
+        model: z.string().optional(),
+        context: z.string().optional(),
+        task_id: z.string().optional(),
+        knowledge: z.string().optional(),
+        memory: z.boolean().optional(),
+        mcp: z.record(z.unknown()).optional()
+      }),
+      execute: async (args: unknown) => {
+        const req = args as ChatRequest; // Plan agent uses similar structure
+        const sessionId = req.task_id || uuidv4();
+        if (!this.sessions.has(sessionId)) {
+          this.sessions.set(sessionId, {
+            id: sessionId,
+            tools: new Map(),
+            context: {},
+            conversation_history: [],
+            active_tools: new Set()
+          });
+        }
+        // Set default model if not provided
+        if (!req.model && this.planModel) {
+          req.model = this.planModel;
+        }
+        const session = this.sessions.get(sessionId)!;
+        try {
+          session.conversation_history.push({
+            role: "user",
+            content: req.prompt,
+            timestamp: new Date().toISOString()
+          });
+          // Use NDJSON streaming
+          const stream = this.ndjsonStream("/agent/plan", req, session);
+          let fullResponse = '';
+          for await (const chunk of stream) {
+            if (chunk.content) fullResponse += chunk.content;
+          }
+          return {
+            type: "text",
+            text: fullResponse
+          };
+        } catch (error) {
+          return {
+            type: "text",
+            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+          };
+        }
+      }
+    };
+    this.server.addTool({
+      name: planTool.name,
+      description: planTool.description,
+      parameters: planTool.parameters as any,
+      execute: async (args: unknown, _context: any) => {
+        const result = await planTool.execute(args);
+        if (typeof result === "string") {
+          return result;
+        } else if (result && typeof result === "object" && "text" in result) {
+          if (!('type' in result)) {
+            return { ...(result as any), type: "text" } as import("./types.js").TextContent;
+          }
+          return result as import("./types.js").TextContent;
+        }
+        return JSON.stringify(result);
+      }
+    });
+    this.tools.set(planTool.name, planTool);
   }
 
   // Add method to find MCP config path
@@ -732,9 +1663,21 @@ export class DisperslMCPServer {
           }
         }
       }
+      // After all connections, update mcpTools
+      this.updateMcpTools();
     } catch (error) {
       console.error("Error initializing MCP connections:", error);
     }
+  }
+
+  private updateMcpTools() {
+    this.mcpTools = Array.from(this.clients.values()).flatMap(client =>
+      Array.from(client.tools.entries()).map(([name, tool]) => ({
+        name,
+        description: tool.description || "",
+        parameters: tool.parameters || {}
+      }))
+    );
   }
 
   private async saveMCPConfig(): Promise<void> {
@@ -764,7 +1707,7 @@ export class DisperslMCPServer {
             return await response.json();
           } else if (config.type === 'sse') {
             // SSE: not for direct tool call, but can be used for streaming events
-            throw new Error('SSE tool execution not implemented');
+            throw new Error('SSE tool execution not supported. Use event subscription instead.');
           }
         }
       };
@@ -789,7 +1732,41 @@ export class DisperslMCPServer {
           }
         }
       }
+      // SSE support: connect and expose event subscription
+      if (config.type === 'sse') {
+        // Helper to convert config.env to headers for fetch
+        const envHeaders = config.env ? { ...config.env } : {};
+        // Use fetch override to inject headers
+        const eventSource = new EventSource(url, {
+          fetch: (input: any, init: any = {}) => {
+            return (fetch as any)(input, {
+              ...init,
+              headers: {
+                ...(init.headers || {}),
+                ...envHeaders
+              }
+            });
+          }
+        } as any); // Type assertion to allow fetch override
+        // Store listeners for this client
+        const listeners: Array<{ event: string, handler: (data: any) => void }> = [];
+        // Attach a subscribe method to the client for SSE events
+        (httpClient as any).subscribeEvent = (event: string, handler: (data: any) => void) => {
+          eventSource.addEventListener(event, (e: MessageEvent) => {
+            let data = e.data;
+            try { data = JSON.parse(e.data); } catch {}
+            handler(data);
+          });
+          listeners.push({ event, handler });
+        };
+        // Optionally, handle errors and reconnection
+        eventSource.addEventListener('error', (err: any) => {
+          console.error(`[SSE][${name}] Error:`, err);
+        });
+        (httpClient as any).eventSource = eventSource;
+      }
       this.clients.set(name, httpClient);
+      this.updateMcpTools();
       return;
     }
     // At this point, config is MCPClientConfig
@@ -849,6 +1826,7 @@ export class DisperslMCPServer {
         return tool.execute(args);
       }
     });
+    this.updateMcpTools();
   }
 
   private async executeMCPTool(toolName: string, args: unknown): Promise<any> {
@@ -927,19 +1905,13 @@ export class DisperslMCPServer {
     session: AgenticSession
   ): Promise<void> {
     try {
-      // Convert MCP tools to OpenRouter format
-      const mcpTools = Array.from(this.clients.values()).flatMap(client =>
-        Array.from(client.tools.entries()).map(([name, tool]) => ({
-          name,
-          description: tool.description || "",
-          parameters: tool.parameters || {}
-        }))
-      );
+      // Use up-to-date mcpTools
+      const mcpTools = this.mcpTools;
 
       // Make initial API call to get the agentic response with tools
       const response = await this.callDisperslAPI(endpoint, "POST", {
         ...args,
-        conversation_id: session.id,
+        task_id: session.id,
         mcp: {
           tools: mcpTools
         }
@@ -982,14 +1954,8 @@ export class DisperslMCPServer {
     session: AgenticSession
   ): Promise<AsyncGenerator<string, void, unknown>> {
     try {
-      // Convert MCP tools to OpenRouter format
-      const mcpTools = Array.from(this.clients.values()).flatMap(client =>
-        Array.from(client.tools.entries()).map(([name, tool]) => ({
-          name,
-          description: tool.description || "",
-          parameters: tool.parameters || {}
-        }))
-      );
+      // Use up-to-date mcpTools
+      const mcpTools = this.mcpTools;
 
       // Make initial API call to get the agentic response with tools
       const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
@@ -1000,7 +1966,7 @@ export class DisperslMCPServer {
         },
         body: JSON.stringify({
           ...args,
-          conversation_id: session.id,
+          task_id: session.id,
           mcp: {
             tools: mcpTools
           }
@@ -1108,12 +2074,36 @@ export class DisperslMCPServer {
         // Handle handover to another agent
         if (functionName === "handover_task") {
           const handoverContent = JSON.parse(functionArgs.content);
-          const { endpoint, prompt, ...additionalArgs } = handoverContent;
+          const { agent_name, prompt, ...additionalArgs } = handoverContent;
+          var endpoint = '';
+
+          switch (agent_name) {
+            case "code":
+              endpoint = '/agent/code'
+              break;
+            case "test":
+              endpoint = '/agent/test'
+              break;
+            case "git":
+              endpoint = '/agent/git'
+              break;
+            case "docs":
+              endpoint = '/agent/documentation/repo'
+              break; 
+            case "chat":
+              endpoint = '/agent/chat'
+              break;
+            case "plan":
+              endpoint = '/agent/plan'
+              break;
+            default:
+              break;
+          }
 
           response = await this.callDisperslAPI(endpoint, "POST", {
             prompt,
             ...additionalArgs,
-            conversation_id: session.id
+            task_id: session.id
           });
 
           toolResponses.push({
@@ -1157,12 +2147,12 @@ export class DisperslMCPServer {
     // Continue conversation with tool responses if session should continue
     if (shouldContinue && toolResponses.length > 0) {
       try {
-        const response = await this.callDisperslAPI("/chat", "POST", {
+        const response = await this.callDisperslAPI("/agent/chat", "POST", {
           prompt: JSON.stringify({
             tool_responses: toolResponses,
             context: session.context
           }),
-          conversation_id: session.id,
+          task_id: session.id,
           model: "meta-llama/llama-4-maverick:free"
         });
 
@@ -1503,6 +2493,78 @@ export class DisperslMCPServer {
     if (!this.apiKey) {
       throw new Error("DISPERSL_API_KEY is required");
     }
+    const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
+      method,
+      headers: {
+        "Authorization": `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    if (!response.ok) {
+      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  // NDJSON Streaming Helper (refactored)
+  private async *ndjsonStream(endpoint: string, args: any, session?: AgenticSession): AsyncGenerator<any, void, unknown> {
+    const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(args)
+    });
+    if (!response.body) throw new Error("No response body for NDJSON stream");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let done = false;
+    let fullResponse = '';
+    while (!done) {
+      const { value, done: streamDone } = await reader.read();
+      if (streamDone) break;
+      buffer += decoder.decode(value, { stream: true });
+      let lines = buffer.split('\n');
+      buffer = lines.pop()!; // last line may be incomplete
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let data;
+        try {
+          data = JSON.parse(line);
+        } catch (e) {
+          continue; // skip malformed lines
+        }
+        // Optionally accumulate content for session
+        if (data.content) fullResponse += data.content;
+        yield data;
+      }
+    }
+    // Optionally update session with final response
+    if (session) {
+      const toolName = endpoint.replace('/', '').replace('/', '_');
+      session.tools.set(toolName, {
+        name: toolName,
+        description: `Tool for ${endpoint}`,
+        parameters: {},
+        execute: async () => ({}),
+        lastResponse: {
+          content: fullResponse,
+          context: session.context
+        }
+      });
+      session.conversation_history.push({
+        role: "assistant",
+        content: fullResponse || "Operation completed",
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  // Generic application/json endpoint helper
+  private async callJsonEndpoint(endpoint: string, method: string = "GET", body?: any): Promise<any> {
     const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
       method,
       headers: {

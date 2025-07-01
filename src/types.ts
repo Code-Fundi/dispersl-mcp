@@ -4,7 +4,7 @@ import { z } from "zod";
 export interface BaseRequest {
   model?: string;
   context?: string;
-  conversation_id?: string;
+  task_id?: string;
   knowledge?: string;
   os?: string;
   default_dir?: string;

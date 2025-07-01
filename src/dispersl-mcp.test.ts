@@ -8,15 +8,20 @@ describe("DisperslMCPServer", () => {
   let client: Client;
 
   beforeAll(async () => {
-    // Start the server
-    server = new DisperslMCPServer();
+    // Use DISPERSL_API_KEY from environment (set in GitHub Actions)
+    const apiKey = process.env.DISPERSL_API_KEY;
+    if (!apiKey) {
+      throw new Error("DISPERSL_API_KEY environment variable must be set for tests (e.g. in GitHub Actions secrets)");
+    }
+    // Start the server with the API key
+    server = new DisperslMCPServer(apiKey);
     await server.start(8080); // Use a different port for testing
 
     // Create a client to connect to the server
     const transport = new StdioClientTransport({
       command: "node",
       args: ["dist/server.js"],
-      env: { PORT: "8080" }
+      env: { PORT: "8080", DISPERSL_API_KEY: apiKey }
     });
 
     client = new Client({
@@ -54,60 +59,60 @@ describe("DisperslMCPServer", () => {
   describe("Code Generation", () => {
     it("should generate code based on a prompt", async () => {
       const response = await client.callTool({
-        name: "build_code",
+        name: "dispersl_code_agent",
         arguments: {
           prompt: "Create a simple hello world function",
           model: "meta-llama/llama-4-maverick:free"
         }
       });
 
-      expect(response.status).toBe("success");
-      expect(response.content).toBeDefined();
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
     });
   });
 
   describe("Testing", () => {
     it("should generate tests based on a prompt", async () => {
       const response = await client.callTool({
-        name: "build_tests",
+        name: "dispersl_testing_agent",
         arguments: {
           prompt: "Create tests for a hello world function",
           model: "meta-llama/llama-4-maverick:free"
         }
       });
 
-      expect(response.status).toBe("success");
-      expect(response.content).toBeDefined();
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
     });
   });
 
   describe("Git Operations", () => {
     it("should execute Git operations based on a prompt", async () => {
       const response = await client.callTool({
-        name: "git_operation",
+        name: "dispersl_git_agent",
         arguments: {
           prompt: "Initialize a new Git repository",
           model: "meta-llama/llama-4-maverick:free"
         }
       });
 
-      expect(response.status).toBe("success");
-      expect(response.content).toBeDefined();
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
     });
   });
 
   describe("Documentation", () => {
     it("should generate documentation for a repository", async () => {
       const response = await client.callTool({
-        name: "generate_docs",
+        name: "dispersl_new_docs_agent",
         arguments: {
           url: "https://github.com/example/repo",
           model: "meta-llama/llama-4-maverick:free"
         }
       });
 
-      expect(response.status).toBe("success");
-      expect(response.content).toBeDefined();
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
     });
   });
 
@@ -123,23 +128,57 @@ describe("DisperslMCPServer", () => {
 
       // Send a chat message
       const response = await client.callTool({
-        name: "chat",
+        name: "dispersl_chat_agent",
         arguments: {
           prompt: "Hello, how are you?",
           model: "meta-llama/llama-4-maverick:free",
-          conversation_id: "test-session"
+          task_id: "test-session"
         }
       });
 
-      expect(response.status).toBe("success");
-      expect(response.content).toBeDefined();
-      expect(Array.isArray(response.content)).toBe(true);
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      expect(typeof response.text).toBe("string");
 
       // End the session
       await client.callTool({
         name: "end_session",
         arguments: {
           session_id: "test-session"
+        }
+      });
+    });
+  });
+
+  describe("Plan Agent", () => {
+    it("should handle plan agent interactions", async () => {
+      // Start a session
+      await client.callTool({
+        name: "start_session",
+        arguments: {
+          session_id: "test-plan-session"
+        }
+      });
+
+      // Send a plan agent message
+      const response = await client.callTool({
+        name: "dispersl_plan_agent",
+        arguments: {
+          prompt: "Plan a multi-agent workflow for building and testing a web app",
+          model: "meta-llama/llama-4-maverick:free",
+          task_id: "test-plan-session"
+        }
+      });
+
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      expect(typeof response.text).toBe("string");
+
+      // End the session
+      await client.callTool({
+        name: "end_session",
+        arguments: {
+          session_id: "test-plan-session"
         }
       });
     });
@@ -188,7 +227,7 @@ describe("DisperslMCPServer", () => {
         arguments: {
           prompt: "Hello, this is a test conversation",
           model: "meta-llama/llama-4-maverick:free",
-          conversation_id: "test-conversation"
+          task_id: "test-conversation"
         }
       });
 
@@ -206,7 +245,7 @@ describe("DisperslMCPServer", () => {
       const getResponse = await client.callTool({
         name: "get_conversation",
         arguments: {
-          conversation_id: "test-conversation"
+          task_id: "test-conversation"
         }
       });
 
