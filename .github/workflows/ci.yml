@@ -30,7 +30,9 @@ jobs:
       run: npm run build
     
     - name: Run tests
-      run: npm test
+      run: pnpm test
+      env:
+        DISPERSL_API_KEY: ${{ secrets.DISPERSL_API_KEY }}
 
   lint:
     runs-on: ubuntu-latest
