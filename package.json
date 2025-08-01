@@ -1,6 +1,6 @@
 {
   "name": "dispersl-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server for Dispersl",
   "type": "module",
   "main": "dist/server.js",
@@ -11,7 +11,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/server.ts",
-    "dev:gui": "npx @modelcontextprotocol/inspector node ./src/server.ts",
+    "dev:gui": "npx @modelcontextprotocol/inspector node ./dist/server.js",
     "start": "node dist/server.js",
     "test": "vitest",
     "test:gui": "tsc && npx @modelcontextprotocol/inspector node ./dist/server.js",
