@@ -26,7 +26,7 @@ describe("DisperslMCPServer", () => {
 
     client = new Client({
       name: "test-client",
-      version: "0.1.0",
+      version: "0.1.1",
       transport
     });
 
@@ -46,7 +46,7 @@ describe("DisperslMCPServer", () => {
 
       expect(response.status).toBe("success");
       expect(response.models).toBeDefined();
-      const models = response.models as any[];
+      const models = response.models as unknown as { id: string; name: string; description: string; context_length: number; tier_requirements: string }[];
       expect(models.length).toBeGreaterThan(0);
       expect(models[0]).toHaveProperty("id");
       expect(models[0]).toHaveProperty("name");
@@ -251,7 +251,7 @@ describe("DisperslMCPServer", () => {
 
       expect(getResponse.status).toBe("success");
       expect(getResponse.conversation).toBeDefined();
-      const conversation = getResponse.conversation as any;
+      const conversation = getResponse.conversation as unknown as { id: string; messages: string[] };
       expect(conversation?.id).toBe("test-conversation");
       expect(conversation?.messages).toBeDefined();
       expect(Array.isArray(conversation?.messages)).toBe(true);

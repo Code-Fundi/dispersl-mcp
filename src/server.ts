@@ -16,12 +16,8 @@ import {
   BaseResponse,
   BuildCodeRequest,
   BuildTestsRequest,
-  BuildDocsRequest,
   ChatRequest,
-  ChatResponse,
-  MCPServerConfig,
   MCPConfig,
-  DisperslMCPError,
   UserError,
   MCPTool,
   MCPClient,
@@ -30,11 +26,8 @@ import {
   GitOperationRequest,
   GenerateDocsRequest,
   Content,
-  TextContent,
   ImageContent,
   AudioContent,
-  ResourceContent,
-  MCPToolCallRequest,
   MCPHttpConfig
 } from "./types.js";
 import { v4 as uuidv4 } from "uuid";
@@ -49,27 +42,37 @@ const execAsync = async (command: string, args?: string[]) => {
 
 // API Configuration
 const test = true;
-const DISPERSL_API_BASE = test ? "http://localhost:3000" : "https://api.dispersl.com/v1";
+const DISPERSL_API_BASE = test ? "http://localhost:3001/v1" : "https://api.dispersl.com/v1";
 
-// Type Definitions
-interface ApiResponse {
-  status: "success" | "error";
-  content?: string | Content[];
-  error?: string;
-}
-
+// Interface for a tool call received from the Dispersl API
 interface ToolCall {
+  id?: string;
   function: {
     name: string;
     arguments: string;
   };
 }
 
+// Interface for a tool execution response
 interface ToolResponse {
   status: "SUCCESS" | "FAILURE";
   message: string;
   tool: string;
   output: string;
+}
+
+// Interface for handover information
+interface HandoverInfo {
+  endpoint: string;
+  prompt: string;
+  additionalArgs: Record<string, any>;
+}
+
+// Add this helper at the top after imports
+function logIfTest(...args: any[]) {
+  if (test) {
+    process.stderr.write(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))).join(' ') + '\n');
+  }
 }
 
 // Main Server Class
@@ -103,7 +106,7 @@ export class DisperslMCPServer {
 
     this.server = new FastMCP({
       name: "dispersl-mcp",
-      version: "0.1.0",
+      version: "0.1.1",
       instructions: "I am an MCP server that can act as both a server and client. I can connect to other MCP servers and execute their tools in agentic loops.",
       health: {
         enabled: true,
@@ -123,60 +126,22 @@ export class DisperslMCPServer {
   }
 
   private setupTools() {
-    // Model Management
-    const listModelsTool: MCPTool = {
-      name: "list_models",
-      description: "List available models",
-      parameters: z.object({}),
-      execute: async () => {
-        const models = [
-          {
-            id: "meta-llama/llama-4-maverick:free",
-            name: "Llama 4 Maverick",
-            description: "A powerful language model for code generation and analysis",
-            context_length: 8192,
-            tier_requirements: { free_model: true }
-          }
-        ];
-        return {
-          type: "text",
-          text: JSON.stringify({ status: "success", models })
-        };
-      }
-    };
-    this.server.addTool({
-      name: listModelsTool.name,
-      description: listModelsTool.description,
-      parameters: listModelsTool.parameters as any,
-      execute: async (args: unknown, _context: any) => {
-        const result = await listModelsTool.execute(args);
-        if (typeof result === "string") {
-          return result;
-        } else if (result && typeof result === "object" && "text" in result) {
-          if (!('type' in result)) {
-            return { ...(result as any), type: "text" } as import("./types.js").TextContent;
-          }
-          return result as import("./types.js").TextContent;
-        }
-        return JSON.stringify(result);
-      }
-    });
-    this.tools.set(listModelsTool.name, listModelsTool);
-
-    // Code Generation
-    const buildCodeTool: MCPTool = {
-      name: "dispersl_code_agent",
-      description: "Generate code files and codebases based on a prompt using agentic execution",
+    // Plan Agent
+    const planTool: MCPTool = {
+      name: "dispersl_plan_agent",
+      description: "Multi-agent task dispersion using agentic execution (plan agent). Agent choices can either be use 'code', 'test', 'git', 'docs' as the agent choices",
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
-        context: z.string().optional(),
+        context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
-        knowledge: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
+        memory: z.boolean().optional(),
+        agent_choice: z.array(z.string()).nonempty(),
         mcp: z.record(z.unknown()).optional()
       }),
       execute: async (args: unknown) => {
-        const req = args as BuildCodeRequest;
+        const req = args as ChatRequest; // Plan agent uses similar structure
         const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
@@ -188,42 +153,48 @@ export class DisperslMCPServer {
           });
         }
         // Set default model if not provided
-        if (!req.model && this.coderModel) {
-          req.model = this.coderModel;
+        if (!req.model && this.planModel) {
+          req.model = this.planModel;
         }
         const session = this.sessions.get(sessionId)!;
         try {
+          session.conversation_history.push({
+            role: "user",
+            content: req.prompt,
+            timestamp: new Date().toISOString()
+          });
           // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/code", req, session);
+          const stream = this.ndjsonStream("/agent/plan", req, session);
           let fullResponse = '';
           for await (const chunk of stream) {
             if (chunk.content) fullResponse += chunk.content;
           }
-          session.tools.set("dispersl_code_agent", {
-            name: "dispersl_code_agent",
-            description: buildCodeTool.description,
-            parameters: buildCodeTool.parameters,
-            execute: async () => fullResponse,
-            lastResponse: { content: fullResponse }
-          });
           return {
-            type: "text",
-            text: fullResponse || "Code generation completed"
+            content: [
+              {
+                type: "text",
+                text: fullResponse
+              }
+            ]
           };
         } catch (error) {
           return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
           };
         }
       }
     };
     this.server.addTool({
-      name: buildCodeTool.name,
-      description: buildCodeTool.description,
-      parameters: buildCodeTool.parameters as any,
+      name: planTool.name,
+      description: planTool.description,
+      parameters: planTool.parameters as any,
       execute: async (args: unknown, _context: any) => {
-        const result = await buildCodeTool.execute(args as BuildCodeRequest);
+        const result = await planTool.execute(args);
         if (typeof result === "string") {
           return result;
         } else if (result && typeof result === "object" && "text" in result) {
@@ -232,6 +203,109 @@ export class DisperslMCPServer {
           }
           return result as import("./types.js").TextContent;
         }
+        return JSON.stringify(result);
+      }
+    });
+    this.tools.set(planTool.name, planTool);    
+
+    // Code Generation
+    const buildCodeTool: MCPTool = {
+      name: "dispersl_code_agent",
+      description: "Generate code files and codebases based on a prompt using agentic execution",
+      parameters: z.object({
+        prompt: z.string(),
+        model: z.string().optional(),
+        context: z.array(z.string()).optional(),
+        task_id: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
+        mcp: z.record(z.unknown()).optional()
+      }),
+      execute: async (args: unknown, context?: { 
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
+        const req = args as BuildCodeRequest;
+        const sessionId = req.task_id || uuidv4();
+
+        if (!this.sessions.has(sessionId)) {
+          this.sessions.set(sessionId, {
+            id: sessionId,
+            tools: new Map(),
+            context: {},
+            conversation_history: [],
+            active_tools: new Set()
+          });
+        }
+
+        // Set default model if not provided
+        if (!req.model && this.coderModel) {
+          req.model = this.coderModel;
+        }
+
+        const session = this.sessions.get(sessionId)!;
+
+        try {
+          // Stream initial status
+          context?.streamContent?.({
+            type: "text",
+            text: `🚀 Starting agentic execution loop for /agent/code\n\n`
+          });
+
+          // Use executeDisperslAgent for full agentic loop
+          await this.executeDisperslAgent("/agent/code", req, session, (message) => {
+            context?.streamContent?.({
+              type: "text",
+              text: message + "\n"
+            });
+          });
+          const toolName = "dispersl_code_agent";
+          const sessionTool = session.tools.get(toolName);
+          
+          // Compile all responses from the session
+          const compiledResponse = this.compileSessionResponses(session, "dispersl_code_agent");
+          
+          // Stream completion message
+          context?.streamContent?.({
+            type: "text",
+            text: `🎉 **Agentic execution completed!**\n\n`
+          });
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: compiledResponse || sessionTool?.lastResponse?.content || "Code generation completed"
+              }
+            ]
+          };
+        } catch (error) {
+          logIfTest(`Code generation error: ${error}`);
+          context?.log?.error("Code generation failed", { error: error instanceof Error ? error.message : "Unknown error" });
+          context?.streamContent?.({
+            type: "text",
+            text: `❌ **Error:** ${error instanceof Error ? error.message : "Unknown error"}\n\n`
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
+          };
+        }
+      }
+    };
+    this.server.addTool({
+      name: buildCodeTool.name,
+      description: buildCodeTool.description,
+      parameters: buildCodeTool.parameters as any,
+      execute: async (args: unknown, context: any) => {
+        const result = await buildCodeTool.execute(args as BuildCodeRequest, context);
+        
+        logIfTest(`TEST: ${result}`)
+
         return JSON.stringify(result);
       }
     });
@@ -244,12 +318,16 @@ export class DisperslMCPServer {
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
-        context: z.string().optional(),
+        context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
-        knowledge: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
         mcp: z.record(z.unknown()).optional()
       }),
-      execute: async (args: unknown) => {
+      execute: async (args: unknown, context?: { 
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
         const req = args as BuildTestsRequest;
         const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
@@ -267,27 +345,36 @@ export class DisperslMCPServer {
         }
         const session = this.sessions.get(sessionId)!;
         try {
-          // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/tests", req, session);
-          let fullResponse = '';
-          for await (const chunk of stream) {
-            if (chunk.content) fullResponse += chunk.content;
-          }
-          session.tools.set("dispersl_testing_agent", {
-            name: "dispersl_testing_agent",
-            description: buildTestsTool.description,
-            parameters: buildTestsTool.parameters,
-            execute: async () => fullResponse,
-            lastResponse: { content: fullResponse }
+          // Use executeDisperslAgent for full agentic loop
+          await this.executeDisperslAgent("/agent/tests", req, session, (message) => {
+            context?.streamContent?.({
+              type: "text",
+              text: message + "\n"
+            });
           });
+          const toolName = "dispersl_testing_agent";
+          const sessionTool = session.tools.get(toolName);
+          
+          // Compile all responses from the session
+          const compiledResponse = this.compileSessionResponses(session, "dispersl_testing_agent");
+          
           return {
-            type: "text",
-            text: fullResponse || "Test generation completed"
+            content: [
+              {
+                type: "text",
+                text: compiledResponse || sessionTool?.lastResponse?.content || "Test generation completed"
+              }
+            ]
           };
         } catch (error) {
+          context?.log?.error("Test generation failed", { error: error instanceof Error ? error.message : "Unknown error" });
           return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
           };
         }
       }
@@ -296,8 +383,8 @@ export class DisperslMCPServer {
       name: buildTestsTool.name,
       description: buildTestsTool.description,
       parameters: buildTestsTool.parameters as any,
-      execute: async (args: unknown, _context: any) => {
-        const result = await buildTestsTool.execute(args);
+      execute: async (args: unknown, context: any) => {
+        const result = await buildTestsTool.execute(args, context);
         if (typeof result === "string") {
           return result;
         } else if (result && typeof result === "object" && "text" in result) {
@@ -318,12 +405,16 @@ export class DisperslMCPServer {
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
-        context: z.string().optional(),
+        context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
-        knowledge: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
         mcp: z.record(z.unknown()).optional()
       }),
-      execute: async (args: unknown) => {
+      execute: async (args: unknown, context?: { 
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
         const req = args as GitOperationRequest;
         const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
@@ -341,27 +432,36 @@ export class DisperslMCPServer {
         }
         const session = this.sessions.get(sessionId)!;
         try {
-          // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/git", req, session);
-          let fullResponse = '';
-          for await (const chunk of stream) {
-            if (chunk.content) fullResponse += chunk.content;
-          }
-          session.tools.set("dispersl_git_agent", {
-            name: "dispersl_git_agent",
-            description: gitOperationTool.description,
-            parameters: gitOperationTool.parameters,
-            execute: async () => fullResponse,
-            lastResponse: { content: fullResponse }
+          // Use executeDisperslAgent for full agentic loop
+          await this.executeDisperslAgent("/agent/git", req, session, (message) => {
+            context?.streamContent?.({
+              type: "text",
+              text: message + "\n"
+            });
           });
+          const toolName = "dispersl_git_agent";
+          const sessionTool = session.tools.get(toolName);
+          
+          // Compile all responses from the session
+          const compiledResponse = this.compileSessionResponses(session, "dispersl_git_agent");
+          
           return {
-            type: "text",
-            text: fullResponse || "Git operation completed"
+            content: [
+              {
+                type: "text",
+                text: compiledResponse || sessionTool?.lastResponse?.content || "Git operations completed"
+              }
+            ]
           };
         } catch (error) {
+          context?.log?.error("Git operations failed", { error: error instanceof Error ? error.message : "Unknown error" });
           return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
           };
         }
       }
@@ -370,8 +470,8 @@ export class DisperslMCPServer {
       name: gitOperationTool.name,
       description: gitOperationTool.description,
       parameters: gitOperationTool.parameters as any,
-      execute: async (args: unknown, _context: any) => {
-        const result = await gitOperationTool.execute(args);
+      execute: async (args: unknown, context: any) => {
+        const result = await gitOperationTool.execute(args, context);
         if (typeof result === "string") {
           return result;
         } else if (result && typeof result === "object" && "text" in result) {
@@ -394,12 +494,16 @@ export class DisperslMCPServer {
         branch: z.string().optional(),
         team_access: z.boolean().optional(),
         model: z.string().optional(),
-        context: z.string().optional(),
+        context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
-        knowledge: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
         mcp: z.record(z.unknown()).optional()
       }),
-      execute: async (args: unknown) => {
+      execute: async (args: unknown, context?: { 
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
         const req = args as GenerateDocsRequest;
         const sessionId = req.task_id || uuidv4();
         if (!this.sessions.has(sessionId)) {
@@ -417,27 +521,36 @@ export class DisperslMCPServer {
         }
         const session = this.sessions.get(sessionId)!;
         try {
-          // Use NDJSON streaming
-          const stream = this.ndjsonStream("/docs/repo", req, session);
-          let fullResponse = '';
-          for await (const chunk of stream) {
-            if (chunk.content) fullResponse += chunk.content;
-          }
-          session.tools.set("dispersl_new_docs_agent", {
-            name: "dispersl_new_docs_agent",
-            description: generateDocsTool.description,
-            parameters: generateDocsTool.parameters,
-            execute: async () => fullResponse,
-            lastResponse: { content: fullResponse }
+          // Use executeDisperslAgent for full agentic loop
+          await this.executeDisperslAgent("/docs/repo", req, session, (message) => {
+            context?.streamContent?.({
+              type: "text",
+              text: message + "\n"
+            });
           });
+          const toolName = "dispersl_new_docs_agent";
+          const sessionTool = session.tools.get(toolName);
+          
+          // Compile all responses from the session
+          const compiledResponse = this.compileSessionResponses(session, "dispersl_new_docs_agent");
+          
           return {
-            type: "text",
-            text: fullResponse || "Documentation generation completed"
+            content: [
+              {
+                type: "text",
+                text: compiledResponse || sessionTool?.lastResponse?.content || "Documentation generation completed"
+              }
+            ]
           };
         } catch (error) {
+          context?.log?.error("Documentation generation failed", { error: error instanceof Error ? error.message : "Unknown error" });
           return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
           };
         }
       }
@@ -446,8 +559,8 @@ export class DisperslMCPServer {
       name: generateDocsTool.name,
       description: generateDocsTool.description,
       parameters: generateDocsTool.parameters as any,
-      execute: async (args: unknown, _context: any) => {
-        const result = await generateDocsTool.execute(args);
+      execute: async (args: unknown, context: any) => {
+        const result = await generateDocsTool.execute(args, context);
         if (typeof result === "string") {
           return result;
         } else if (result && typeof result === "object" && "text" in result) {
@@ -468,9 +581,9 @@ export class DisperslMCPServer {
       parameters: z.object({
         prompt: z.string(),
         model: z.string().optional(),
-        context: z.string().optional(),
+        context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
-        knowledge: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
         memory: z.boolean().optional(),
         voice: z.boolean().optional(),
         mcp: z.record(z.unknown()).optional()
@@ -499,19 +612,27 @@ export class DisperslMCPServer {
             timestamp: new Date().toISOString()
           });
           // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/chat", req, session);
+          const stream = this.textStream("/agent/chat", req, session);
           let fullResponse = '';
           for await (const chunk of stream) {
             if (chunk.content) fullResponse += chunk.content;
           }
           return {
-            type: "text",
-            text: fullResponse
+            content: [
+              {
+                type: "text",
+                text: fullResponse                
+              }
+            ]
           };
         } catch (error) {
           return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
           };
         }
       }
@@ -540,12 +661,13 @@ export class DisperslMCPServer {
       name: "start_session",
       description: "Start a new agentic session",
       parameters: z.object({
-        session_id: z.string()
+        session_id: z.string().optional()
       }),
       execute: async (args: unknown) => {
-        const req = args as { session_id: string };
-        this.sessions.set(req.session_id, {
-          id: req.session_id,
+        const req = args as { session_id?: string };
+        const sessionId = req.session_id || uuidv4();
+        this.sessions.set(sessionId, {
+          id: sessionId,
           tools: new Map(),
           context: {},
           conversation_history: [],
@@ -553,7 +675,7 @@ export class DisperslMCPServer {
         });
         return {
           type: "text",
-          text: `Session ${req.session_id} started`
+          text: `Session ${sessionId} started`
         };
       }
     };
@@ -658,7 +780,9 @@ export class DisperslMCPServer {
           // Close connection if exists
           const client = this.clients.get(req.name);
           if (client) {
-            await client.client.close();
+            if (client.client && typeof (client.client as any).close === "function") {
+              await (client.client as any).close();
+            }
             this.clients.delete(req.name);
           }
 
@@ -697,41 +821,36 @@ export class DisperslMCPServer {
         return JSON.stringify(result);
       }
     });
-    this.tools.set(removeMCPServerTool.name, removeMCPServerTool);    
+    this.tools.set(removeMCPServerTool.name, removeMCPServerTool);
 
-    // Models
-    const getModelsTool: MCPTool = {
-      name: "get_models",
-      description: "List available AI models",
+    // Model Management
+    const listModelsTool: MCPTool = {
+      name: "list_models",
+      description: "List available models",
       parameters: z.object({}),
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/models", "GET");
-          return { type: "text", text: JSON.stringify(result) };
+          logIfTest("[listModelsTool] API result:", result);
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("[listModelsTool] Error:", error);
+          return { content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` }] };
         }
       }
     };
     this.server.addTool({
-      name: getModelsTool.name,
-      description: getModelsTool.description,
-      parameters: getModelsTool.parameters as any,
-      execute: async (args: unknown, _context: any): Promise<any> => {
-        const result = await getModelsTool.execute(args);
-        if (result && typeof result === "object" && "type" in result && result.type === "data") {
-          return result;
-        } else if (typeof result === "string") return result;
-        if (result && typeof result === "object" && "text" in result) {
-          if (!('type' in result)) {
-            return { ...(result as any), type: "text" } as import("./types.js").TextContent;
-          }
-          return result as import("./types.js").TextContent;
-        }
-        return result;
+      name: listModelsTool.name,
+      description: listModelsTool.description,
+      parameters: listModelsTool.parameters as any,
+      execute: async (args: unknown, _context: any) => {
+        const result = await listModelsTool.execute(args);
+        return {
+          content: [{ text: (result as any).text, type: "text" }]
+        };
       }
     });
-    this.tools.set(getModelsTool.name, getModelsTool);
+    this.tools.set(listModelsTool.name, listModelsTool);    
 
     // API Keys
     const getKeysTool: MCPTool = {
@@ -741,9 +860,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/keys", "GET");
-          return { type: "data", data: result };
+          logIfTest("get_keys API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_keys Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -784,9 +905,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/keys/new", "GET");
-          return { type: "data", data: result };
+          logIfTest("new_key API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("new_key Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -828,9 +951,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint("/tasks/new", "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("create_task API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("create_task Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -871,9 +996,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/tasks/${args.id}/edit`, "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("edit_task API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("edit_task Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -914,9 +1041,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/tasks", "GET");
-          return { type: "data", data: result };
+          logIfTest("get_tasks API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_tasks Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -957,9 +1086,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/tasks/${args.id}`, "GET");
-          return { type: "data", data: result };
+          logIfTest("get_task API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_task Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1000,9 +1131,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/tasks/${args.id}/cancel`, "DELETE");
-          return { type: "data", data: result };
+          logIfTest("cancel_task API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("cancel_task Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1044,9 +1177,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/steps/${args.id}/edit`, "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("edit_step API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("edit_step Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1087,9 +1222,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/steps", "GET");
-          return { type: "data", data: result };
+          logIfTest("get_steps API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_steps Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1130,9 +1267,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/steps/${args.id}`, "GET");
-          return { type: "data", data: result };
+          logIfTest("get_step API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_step Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1173,9 +1312,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/steps/${args.id}/cancel`, "DELETE");
-          return { type: "data", data: result };
+          logIfTest("cancel_step API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("cancel_step Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1217,9 +1358,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint("/stats/usage", "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("get_usage_stats API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_usage_stats Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1260,9 +1403,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint("/stats/language", "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("get_language_stats API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_language_stats Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1303,9 +1448,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint("/stats/agent", "POST", args.body);
-          return { type: "data", data: result };
+          logIfTest("get_agent_stats API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_agent_stats Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1347,9 +1494,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/history/${args.id}`, "GET", args.body);
-          return { type: "data", data: result };
+          logIfTest("get_task_history API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_task_history Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1390,9 +1539,11 @@ export class DisperslMCPServer {
       execute: async (args: any) => {
         try {
           const result = await this.callJsonEndpoint(`/history/${args.id}/step`, "GET", args.body);
-          return { type: "data", data: result };
+          logIfTest("get_step_history API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("get_step_history Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1434,9 +1585,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/fetch", "GET");
-          return { type: "data", data: result };
+          logIfTest("fetch_api_root API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("fetch_api_root Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1477,9 +1630,11 @@ export class DisperslMCPServer {
       execute: async () => {
         try {
           const result = await this.callJsonEndpoint("/health", "GET");
-          return { type: "data", data: result };
+          logIfTest("health_check API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
-          return { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` };
+          logIfTest("health_check Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
         }
       }
     };
@@ -1520,79 +1675,6 @@ export class DisperslMCPServer {
     this.tools.delete("build_git_agentic");
     this.tools.delete("generate_docs_agentic");
     this.tools.delete("chat_agentic");
-
-    // Plan Agent
-    const planTool: MCPTool = {
-      name: "dispersl_plan_agent",
-      description: "Multi-agent task dispersion using agentic execution (plan agent)",
-      parameters: z.object({
-        prompt: z.string(),
-        model: z.string().optional(),
-        context: z.string().optional(),
-        task_id: z.string().optional(),
-        knowledge: z.string().optional(),
-        memory: z.boolean().optional(),
-        mcp: z.record(z.unknown()).optional()
-      }),
-      execute: async (args: unknown) => {
-        const req = args as ChatRequest; // Plan agent uses similar structure
-        const sessionId = req.task_id || uuidv4();
-        if (!this.sessions.has(sessionId)) {
-          this.sessions.set(sessionId, {
-            id: sessionId,
-            tools: new Map(),
-            context: {},
-            conversation_history: [],
-            active_tools: new Set()
-          });
-        }
-        // Set default model if not provided
-        if (!req.model && this.planModel) {
-          req.model = this.planModel;
-        }
-        const session = this.sessions.get(sessionId)!;
-        try {
-          session.conversation_history.push({
-            role: "user",
-            content: req.prompt,
-            timestamp: new Date().toISOString()
-          });
-          // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/plan", req, session);
-          let fullResponse = '';
-          for await (const chunk of stream) {
-            if (chunk.content) fullResponse += chunk.content;
-          }
-          return {
-            type: "text",
-            text: fullResponse
-          };
-        } catch (error) {
-          return {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
-          };
-        }
-      }
-    };
-    this.server.addTool({
-      name: planTool.name,
-      description: planTool.description,
-      parameters: planTool.parameters as any,
-      execute: async (args: unknown, _context: any) => {
-        const result = await planTool.execute(args);
-        if (typeof result === "string") {
-          return result;
-        } else if (result && typeof result === "object" && "text" in result) {
-          if (!('type' in result)) {
-            return { ...(result as any), type: "text" } as import("./types.js").TextContent;
-          }
-          return result as import("./types.js").TextContent;
-        }
-        return JSON.stringify(result);
-      }
-    });
-    this.tools.set(planTool.name, planTool);
   }
 
   // Add method to find MCP config path
@@ -1612,7 +1694,7 @@ export class DisperslMCPServer {
       try {
         // Check if file exists synchronously for initial setup
         require('fs').accessSync(path, require('fs').constants.F_OK);
-        process.stderr.write(`Found MCP config at: ${path}\n`);
+        logIfTest(`Found MCP config at: ${path}\n`);
         return path;
       } catch (error) {
         // File doesn't exist, continue to next path
@@ -1620,7 +1702,7 @@ export class DisperslMCPServer {
     }
 
     // Default to local project .dispersl directory
-    process.stderr.write(`No existing MCP config found, will create at: ${paths[0]}\n`);
+    logIfTest(`No existing MCP config found, will create at: ${paths[0]}\n`);
     return paths[0];
   }
 
@@ -1628,12 +1710,12 @@ export class DisperslMCPServer {
     try {
       const configContent = await readFile(this.mcpConfigPath, "utf-8");
       this.mcpConfig = JSON.parse(configContent);
-      process.stderr.write(`Loaded MCP config from: ${this.mcpConfigPath}\n`);
+      logIfTest(`Loaded MCP config from: ${this.mcpConfigPath}\n`);
       if (this.mcpConfig && this.mcpConfig.mcpServers) {
-        process.stderr.write(`Found ${Object.keys(this.mcpConfig.mcpServers).length} server(s) in config\n`);
+        logIfTest(`Found ${Object.keys(this.mcpConfig.mcpServers).length} server(s) in config\n`);
       }
     } catch (error) {
-      process.stderr.write(`No MCP config found at ${this.mcpConfigPath}, creating default config\n`);
+      logIfTest(`No MCP config found at ${this.mcpConfigPath}, creating default config\n`);
       // If config doesn't exist, create default
       this.mcpConfig = {
         mcpServers: {}
@@ -1648,7 +1730,7 @@ export class DisperslMCPServer {
 
       if (this.mcpConfig && this.mcpConfig.mcpServers) {
         const serverEntries = Object.entries(this.mcpConfig.mcpServers);
-        process.stderr.write(`Initializing ${serverEntries.length} MCP server connections...\n`);
+        logIfTest(`Initializing ${serverEntries.length} MCP server connections...\n`);
 
         for (const [name, serverConfig] of serverEntries) {
           if ('type' in serverConfig && (serverConfig.type === 'streamable-http' || serverConfig.type === 'sse')) {
@@ -1657,16 +1739,16 @@ export class DisperslMCPServer {
           }
           try {
             await this.connectToMCPServer(serverConfig as MCPClientConfig, name);
-            process.stderr.write(`✓ Connected to MCP server: ${name}\n`);
+            logIfTest(`✓ Connected to MCP server: ${name}\n`);
           } catch (error) {
-            console.error(`✗ Failed to connect to MCP server ${name}:`, error);
+            logIfTest(`✗ Failed to connect to MCP server ${name}:`, error);
           }
         }
       }
       // After all connections, update mcpTools
       this.updateMcpTools();
     } catch (error) {
-      console.error("Error initializing MCP connections:", error);
+      logIfTest("Error initializing MCP connections:", error);
     }
   }
 
@@ -1761,7 +1843,7 @@ export class DisperslMCPServer {
         };
         // Optionally, handle errors and reconnection
         eventSource.addEventListener('error', (err: any) => {
-          console.error(`[SSE][${name}] Error:`, err);
+          logIfTest(`[SSE][${name}] Error:`, err);
         });
         (httpClient as any).eventSource = eventSource;
       }
@@ -1778,7 +1860,7 @@ export class DisperslMCPServer {
     });
     const client = new Client({
       name,
-      version: "0.1.0"
+      version: "0.1.1"
     }, {
       capabilities: {}
     });
@@ -1841,7 +1923,7 @@ export class DisperslMCPServer {
         const result = await client.executeTool(toolName, args);
         return result;
       } catch (error) {
-        console.error(`Failed to execute tool ${toolName} on client ${clientName}:`, error);
+        logIfTest(`Failed to execute tool ${toolName} on client ${clientName}:`, error);
       }
     }
 
@@ -1888,13 +1970,13 @@ export class DisperslMCPServer {
             return JSON.stringify(parsedResponse, null, 2);
           }
         } catch (error) {
-          console.debug('Failed to parse as JSON, returning cleaned text');
+          logIfTest('Failed to parse as JSON, returning cleaned text');
         }
       }
 
       return cleaned;
     } catch (error) {
-      console.error('Error in cleanOutput:', error);
+      logIfTest('Error in cleanOutput:', error);
       return input;
     }
   }
@@ -1902,229 +1984,294 @@ export class DisperslMCPServer {
   private async executeDisperslAgent(
     endpoint: string,
     args: BaseRequest & { prompt?: string; url?: string },
-    session: AgenticSession
+    session: AgenticSession,
+    progressCallback?: (message: string, data?: any) => void
   ): Promise<void> {
-    try {
-      // Use up-to-date mcpTools
-      const mcpTools = this.mcpTools;
+    let currentEndpoint = endpoint;
+    let currentArgs = { ...args, task_id: session.id };
+    let iteration = 0;
+    const maxIterations = 30; // Prevent infinite loops
 
-      // Make initial API call to get the agentic response with tools
-      const response = await this.callDisperslAPI(endpoint, "POST", {
-        ...args,
-        task_id: session.id,
-        mcp: {
-          tools: mcpTools
-        }
-      });
+    logIfTest(`Starting agentic execution loop for ${endpoint}`);
 
-      // Update session context
-      session.context = { ...session.context, ...response.context };
+    while (iteration < maxIterations) {
+      logIfTest(`Starting iteration ${iteration + 1}/${maxIterations}`);
+      
+      try {
+        // Use up-to-date mcpTools
+        const mcpTools = this.mcpTools;
 
-      // If response includes tools to execute, process them
-      if (response.tools && Array.isArray(response.tools)) {
-        await this.processToolCalls(response.tools, session);
-      }
+        // Make streaming API call using ndjsonStream
+        logIfTest(`Making API call to dispersl endpoint: ${currentEndpoint}`);
+        const stream = this.ndjsonStream(currentEndpoint, {
+          ...currentArgs,
+          mcp: { tools: mcpTools }
+        }, session);
 
-      // Update session with final response
-      const toolName = endpoint.replace('/', '').replace('/', '_');
-      session.tools.set(toolName, {
-        name: toolName,
-        description: `Tool for ${endpoint}`,
-        parameters: {},
-        execute: async () => response,
-        lastResponse: response
-      });
+        let fullResponse = '';
+        const toolCalls: ToolCall[] = [];
+        let hasContentChunks = false;
+        let hasStructuredResponse = false;
 
-      // Add to conversation history
-      session.conversation_history.push({
-        role: "assistant",
-        content: response.content || "Operation completed",
-        timestamp: new Date().toISOString()
-      });
-
-    } catch (error) {
-      console.error(`Error in executeDisperslAgent for ${endpoint}:`, error);
-      throw error;
-    }
-  }
-
-  private async executeDisperslStream(
-    endpoint: string,
-    args: BaseRequest & { prompt?: string; url?: string },
-    session: AgenticSession
-  ): Promise<AsyncGenerator<string, void, unknown>> {
-    try {
-      // Use up-to-date mcpTools
-      const mcpTools = this.mcpTools;
-
-      // Make initial API call to get the agentic response with tools
-      const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          ...args,
-          task_id: session.id,
-          mcp: {
-            tools: mcpTools
+        // Collect streaming response
+        logIfTest("Starting to collect streaming response");
+        
+        for await (const chunk of stream) {
+          if (chunk.content) {
+            fullResponse += chunk.content;
+            hasContentChunks = true;
+            logIfTest(`[Stream] Content chunk: ${chunk.content}`);
           }
-        })
-      });
-
-      if (!response.body) throw new Error("No response body for NDJSON stream");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let done = false;
-      let fullResponse = '';
-
-      async function* ndjsonStream() {
-        while (!done) {
-          const { value, done: streamDone } = await reader.read();
-          if (streamDone) break;
-          buffer += decoder.decode(value, { stream: true });
-          let lines = buffer.split('\n');
-          buffer = lines.pop()!; // last line may be incomplete
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            let data;
-            try {
-              data = JSON.parse(line);
-            } catch (e) {
-              continue; // skip malformed lines
-            }
-            // Handle NDJSON chunk
-            if (data.status === 'processing') {
-              if (data.content) {
-                yield data.content;
-                fullResponse += data.content;
-              }
-              // Optionally handle tools, knowledge, audio, etc.
-            } else if (data.status === 'complete') {
-              // Optionally yield a completion signal
-              return;
-            } else if (data.status === 'error') {
-              throw new Error(data.error?.message || data.message || 'Unknown error');
-            }
+          if (chunk.tool_calls && Array.isArray(chunk.tool_calls)) {
+            toolCalls.push(...chunk.tool_calls);
+            hasStructuredResponse = true;
+            logIfTest(`[Stream] Structured tool calls: ${JSON.stringify(chunk.tool_calls)}`);
+          }
+          if (chunk.tools && Array.isArray(chunk.tools)) {
+            toolCalls.push(...chunk.tools);
+            hasStructuredResponse = true;
+            logIfTest(`[Stream] Tools array: ${JSON.stringify(chunk.tools)}`);
+          }
+          if (chunk.status === 'processing' && chunk.message && chunk.message !== 'Content chunk') {
+            logIfTest(`[Stream] Processing: ${chunk.message}`);
           }
         }
-      }
+        logIfTest(`Finished collecting streaming response - Content Length: ${fullResponse.length}, Tool Calls: ${toolCalls.length}`);
 
-      // Update session with final response after stream ends
-      const self = this;
-      async function* sessionStream() {
-        for await (const chunk of ndjsonStream()) {
-          yield chunk;
+        // Parse text-based tool calls if no structured calls
+        if (hasContentChunks && !hasStructuredResponse && fullResponse.includes('<｜tool▁call▁begin｜>')) {
+          logIfTest(`[Stream] Parsing text-based tool calls from content`);
+          progressCallback?.("Parsing text-based tool calls from content");
+          progressCallback?.(`🔍 **Parsing text-based tool calls from content...**\n`);
+          const parsedToolCalls = await this.parseTextToolCalls(fullResponse);
+          if (parsedToolCalls.length > 0) {
+            toolCalls.push(...parsedToolCalls);
+            hasStructuredResponse = true;
+            logIfTest(`[Stream] Parsed tool calls: ${JSON.stringify(parsedToolCalls)}`);
+            progressCallback?.("Successfully parsed text-based tool calls");
+            progressCallback?.(`✅ **Successfully parsed ${parsedToolCalls.length} tool call(s)**\n`);
+          }
         }
-        // Update session with final response
-        const toolName = endpoint.replace('/', '').replace('/', '_');
+
+        // Update session context and history
+        // Note: ndjsonStream already updates session.conversation_history with the final response
+        // The stream has already been consumed, so we don't need to await it again
+
+        // Process tool calls
+        progressCallback?.("Processing tool calls");
+        progressCallback?.(`⚙️ **Processing ${toolCalls.length} tool call(s)...**\n`);
+        const { responses: toolResponses, handover } = await this.processToolCalls(toolCalls, session);
+        progressCallback?.("Tool calls processed");
+        progressCallback?.(`✅ **Tool calls processed:** ${toolResponses.length} response(s), Handover: ${handover ? 'Yes' : 'No'}\n`);
+
+        // Update session with tool responses
+        const toolName = currentEndpoint.replace('/', '').replace('/', '_');
+        progressCallback?.("Updating session with tool responses");
         session.tools.set(toolName, {
           name: toolName,
-          description: `Tool for ${endpoint}`,
+          description: `Tool for ${currentEndpoint}`,
           parameters: {},
-          execute: async () => ({}),
-          lastResponse: {
-            content: fullResponse,
-            context: session.context
+          execute: async () => ({ content: fullResponse, tools: toolCalls }),
+          lastResponse: { 
+            content: fullResponse, 
+            tools: toolCalls.map(toolCall => ({
+              name: toolCall.function.name,
+              arguments: JSON.parse(toolCall.function.arguments)
+            }))
           }
         });
+
+        // If no tool calls or session ended, break the loop
+        if (toolResponses.length === 0 || toolResponses.some(r => r.tool === 'end_session')) {
+          logIfTest(`[Loop] Breaking loop: No tool calls or session ended`);
+          progressCallback?.("Breaking loop: No tool calls or session ended");
+          progressCallback?.(`🛑 **Loop ending:** No tool calls or session ended\n\n`);
+          break;
+        }
+
+        // If handover occurred, update endpoint and args for next iteration
+        if (handover) {
+          logIfTest(`[Loop] Handover to endpoint: ${handover.endpoint}`);
+          progressCallback?.("Handover to different endpoint");
+          progressCallback?.(`🔄 **Handover:** Switching from ${currentEndpoint} to ${handover.endpoint}\n\n`);
+          currentEndpoint = handover.endpoint;
+          currentArgs = {
+            ...currentArgs,
+            prompt: handover.prompt,
+            ...handover.additionalArgs,
+            task_id: session.id
+          };
+        } else {
+          // Continue with same endpoint, include tool responses
+          logIfTest(`[Loop] Continuing with same endpoint: ${currentEndpoint}`);
+          progressCallback?.("Continuing with same endpoint");
+          progressCallback?.(`🔄 **Continuing:** Same endpoint ${currentEndpoint} with ${toolResponses.length} tool response(s)\n\n`);
+          currentArgs = {
+            ...currentArgs,
+            prompt: JSON.stringify({
+              tool_responses: toolResponses,
+              context: session.context
+            })
+          };
+        }
+
+        iteration++;
+        progressCallback?.(`Completed iteration ${iteration}/${maxIterations}`);
+        progressCallback?.(`✅ **Iteration ${iteration} completed**\n\n---\n\n`);
+              } catch (error) {
+          logIfTest(`[Loop] Error in executeDisperslAgent for ${currentEndpoint}:`, error);
+          progressCallback?.(`Error in agentic execution loop: ${error instanceof Error ? error.message : "Unknown error"}`);
+          progressCallback?.(`❌ **Error in iteration ${iteration}:** ${error instanceof Error ? error.message : "Unknown error"}\n\n`);
+          session.conversation_history.push({
+            role: "assistant",
+            content: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+            timestamp: new Date().toISOString()
+          });
+          break;
+        }
+      }
+
+      if (iteration >= maxIterations) {
+        logIfTest(`[Loop] Agentic loop reached maximum iterations (${maxIterations}) for ${currentEndpoint}`);
+        progressCallback?.("Agentic loop reached maximum iterations");
+        progressCallback?.(`⚠️ **Maximum iterations reached:** ${maxIterations} iterations completed\n\n`);
         session.conversation_history.push({
           role: "assistant",
-          content: fullResponse || "Operation completed",
+          content: "Agentic loop reached maximum iterations",
           timestamp: new Date().toISOString()
         });
       }
-
-      return sessionStream();
-    } catch (error) {
-      console.error(`Error in executeDisperslStream for ${endpoint}:`, error);
-      throw error;
-    }
+      
+      progressCallback?.("Agentic execution loop completed");
+      
+      // Stream final completion message
+      progressCallback?.(`🎉 **Agentic execution completed!**\n- Total Iterations: ${iteration}\n- Endpoint: ${currentEndpoint}\n- Session ID: ${session.id}\n- Reached Max Iterations: ${iteration >= maxIterations ? 'Yes' : 'No'}\n\n`);
   }
 
-  private async processToolCalls(toolCalls: ToolCall[], session: AgenticSession): Promise<ToolResponse[]> {
+  private compileSessionResponses(session: AgenticSession, toolName: string): string {
+    const responses: string[] = [];
+    
+    // Add conversation history
+    if (session.conversation_history.length > 0) {
+      responses.push("## 📝 Conversation History\n");
+      session.conversation_history.forEach((message, index) => {
+        responses.push(`**${message.role.toUpperCase()} (${index + 1}):** ${message.content}\n`);
+      });
+      responses.push("\n");
+    }
+    
+    // Add tool responses
+    const sessionTool = session.tools.get(toolName);
+    if (sessionTool?.lastResponse?.content) {
+      responses.push("## 🎯 Final Response\n");
+      if (typeof sessionTool.lastResponse.content === 'string') {
+        responses.push(sessionTool.lastResponse.content);
+      } else if (Array.isArray(sessionTool.lastResponse.content)) {
+        sessionTool.lastResponse.content.forEach(content => {
+          if (content.type === 'text' && 'text' in content) {
+            responses.push(content.text);
+          }
+        });
+      }
+      responses.push("\n");
+    }
+    
+    // Add tool calls if available
+    if (sessionTool?.lastResponse?.tools && sessionTool.lastResponse.tools.length > 0) {
+      responses.push("## 🔧 Tool Calls Executed\n");
+      sessionTool.lastResponse.tools.forEach((tool, index) => {
+        responses.push(`**${index + 1}. ${tool.name}**\n`);
+        responses.push(`Arguments: ${JSON.stringify(tool.arguments, null, 2)}\n\n`);
+      });
+    }
+    
+    return responses.join("\n");
+  }
+
+  private async processToolCalls(
+    toolCalls: ToolCall[],
+    session: AgenticSession
+  ): Promise<{ responses: ToolResponse[], handover?: HandoverInfo }> {
     const toolResponses: ToolResponse[] = [];
-    let shouldContinue = true;
+    let handover: HandoverInfo | undefined = undefined;
 
     for (const toolCall of toolCalls) {
-      if (!shouldContinue) break;
-
       try {
         const functionName = toolCall.function.name;
         const functionArgs = JSON.parse(toolCall.function.arguments);
 
-        console.log(`Executing tool: ${functionName}`);
-
-        let response: any;
+        logIfTest(`[processToolCalls] Executing tool: ${functionName} with args: ${JSON.stringify(functionArgs)}`);
 
         // Handle special control tools
         if (functionName === "end_session") {
-          shouldContinue = false;
           toolResponses.push({
             status: "SUCCESS",
             message: "Session ended",
             tool: functionName,
             output: ""
           });
-          continue;
+          return { responses: toolResponses, handover };
         }
 
         // Handle handover to another agent
         if (functionName === "handover_task") {
-          const handoverContent = JSON.parse(functionArgs.content);
+          const handoverContent = functionArgs;
           const { agent_name, prompt, ...additionalArgs } = handoverContent;
-          var endpoint = '';
 
+          let endpoint = '';
           switch (agent_name) {
             case "code":
-              endpoint = '/agent/code'
+              endpoint = '/agent/code';
               break;
             case "test":
-              endpoint = '/agent/test'
+              endpoint = '/agent/tests';
               break;
             case "git":
-              endpoint = '/agent/git'
+              endpoint = '/agent/git';
               break;
             case "docs":
-              endpoint = '/agent/documentation/repo'
-              break; 
+              endpoint = '/docs/repo';
+              break;
             case "chat":
-              endpoint = '/agent/chat'
+              endpoint = '/agent/chat';
               break;
             case "plan":
-              endpoint = '/agent/plan'
+              endpoint = '/agent/plan';
               break;
             default:
-              break;
+              throw new Error(`Unknown agent for handover: ${agent_name}`);
           }
 
-          response = await this.callDisperslAPI(endpoint, "POST", {
-            prompt,
-            ...additionalArgs,
-            task_id: session.id
-          });
-
+          handover = { endpoint, prompt, additionalArgs };
           toolResponses.push({
             status: "SUCCESS",
-            message: "Task handed over successfully",
+            message: `Task handed over to ${agent_name} at ${endpoint}`,
             tool: functionName,
-            output: this.cleanOutput(response.content || "")
+            output: JSON.stringify({ endpoint, prompt, additionalArgs })
           });
-
-          // If handover includes more tools, process them
-          if (response.tools) {
-            const additionalResponses = await this.processToolCalls(response.tools, session);
-            toolResponses.push(...additionalResponses);
-          }
           continue;
         }
 
         // Execute the tool
-        response = await this.executeMCPTool(functionName, functionArgs);
+        const response = await this.executeMCPTool(functionName, functionArgs);
 
-        const cleanedOutput = this.cleanOutput(response.content || response.output || JSON.stringify(response));
+        // Handle different response types
+        let cleanedOutput: string;
+        if (response && typeof response === "object") {
+          if ("type" in response && response.type === "data" && "data" in response) {
+            cleanedOutput = JSON.stringify(response.data, null, 2);
+          } else if ("type" in response && response.type === "text" && "text" in response) {
+            cleanedOutput = this.cleanOutput(response.text || "");
+          } else if ("content" in response) {
+            cleanedOutput = this.cleanOutput(response.content || "");
+          } else if ("output" in response) {
+            cleanedOutput = this.cleanOutput(response.output || "");
+          } else {
+            cleanedOutput = this.cleanOutput(JSON.stringify(response));
+          }
+        } else {
+          cleanedOutput = this.cleanOutput(response?.toString() || "");
+        }
 
         toolResponses.push({
           status: "SUCCESS",
@@ -2132,48 +2279,21 @@ export class DisperslMCPServer {
           tool: functionName,
           output: cleanedOutput
         });
+        logIfTest(`[processToolCalls] Tool response for ${functionName}: ${cleanedOutput}`);
 
       } catch (error) {
-        console.error(`Tool execution error for ${toolCall.function.name}:`, error);
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        logIfTest(`[processToolCalls] Tool execution error for ${toolCall.function.name}: ${errorMessage}`);
         toolResponses.push({
           status: "FAILURE",
-          message: `Error executing tool: ${error instanceof Error ? error.message : "Unknown error"}`,
+          message: `Error executing tool: ${errorMessage}`,
           tool: toolCall.function.name,
           output: ""
         });
       }
     }
 
-    // Continue conversation with tool responses if session should continue
-    if (shouldContinue && toolResponses.length > 0) {
-      try {
-        const response = await this.callDisperslAPI("/agent/chat", "POST", {
-          prompt: JSON.stringify({
-            tool_responses: toolResponses,
-            context: session.context
-          }),
-          task_id: session.id,
-          model: "meta-llama/llama-4-maverick:free"
-        });
-
-        // Update session with continued conversation
-        session.conversation_history.push({
-          role: "assistant",
-          content: response.content,
-          timestamp: new Date().toISOString()
-        });
-
-        // If the response includes more tools, execute them recursively
-        if (response.tools && Array.isArray(response.tools)) {
-          const additionalResponses = await this.processToolCalls(response.tools, session);
-          toolResponses.push(...additionalResponses);
-        }
-      } catch (error) {
-        console.error("Error continuing conversation:", error);
-      }
-    }
-
-    return toolResponses;
+    return { responses: toolResponses, handover };
   }
 
   private async executeBuiltInTool(functionName: string, functionArgs: any): Promise<BaseResponse> {
@@ -2410,13 +2530,75 @@ export class DisperslMCPServer {
     throw new Error(`Built-in tool ${functionName} not implemented`);
   }
 
+  // Helper function to parse text-based tool calls
+  public async parseTextToolCalls (text: string): Promise<any[]> {
+    const parsed: any[] = [];
+
+    // Split by tool call boundaries
+    const toolCallPattern = /<｜tool▁call▁begin｜>/g;
+    const toolCalls = text.split(toolCallPattern).slice(1); // Remove first empty element
+
+    toolCalls.forEach((toolCall, index) => {
+      try {
+        // Extract function name
+        const functionMatch = toolCall.match(/^function<｜tool▁sep｜>([^\n]+)/);
+        if (!functionMatch) return;
+
+        const functionName = functionMatch[1].trim();
+
+        // Extract format (json/text/etc)
+        const formatMatch = toolCall.match(/\n([a-z]+)\n/);
+        const format = formatMatch ? formatMatch[1] : 'json';
+
+        // Extract arguments - everything after the format line
+        const argsStart = toolCall.indexOf('\n' + format + '\n') + format.length + 2;
+        let argsText = toolCall.substring(argsStart).trim();
+
+        // Clean up any trailing markers
+        argsText = argsText.replace(/<｜[^｜]+｜>/g, '').trim();
+
+        // Parse arguments based on format
+        let parsedArgs = {};
+        if (format === 'json') {
+          try {
+            parsedArgs = JSON.parse(argsText);
+          } catch (e) {
+            logIfTest(`Failed to parse JSON args: ${argsText}`);
+            parsedArgs = { raw: argsText };
+          }
+        } else {
+          parsedArgs = { raw: argsText };
+        }
+
+        // Create standardized tool call object
+        const standardizedCall = {
+          index: index,
+          id: `call_${Date.now()}_${index}`, // Generate unique ID
+          type: "function",
+          function: {
+            name: functionName,
+            arguments: JSON.stringify(parsedArgs)
+          }
+        };
+
+        parsed.push(standardizedCall);
+        logIfTest(`Parsed tool call: ${functionName} with args: ${JSON.stringify(parsed)}`);
+
+      } catch (error) {
+        logIfTest(`Error parsing tool call: ${error}`);
+      }
+    });
+
+    return parsed;
+  }  
+
   public async start(port: number = 8080): Promise<void> {
     // Start as MCP server
     const transport = new StdioServerTransport();
     const server = new Server(
       {
         name: "dispersl-mcp",
-        version: "0.1.0"
+        version: "0.1.1"
       },
       {
         capabilities: {
@@ -2460,11 +2642,11 @@ export class DisperslMCPServer {
     });
 
     await server.connect(transport);
-    process.stderr.write(`Dispersl MCP Server started and listening on stdio\n`);
+    logIfTest(`Dispersl MCP Server started and listening on stdio\n`);
 
     // Add this to ensure the process doesn't exit immediately
     if (process.stdin.isTTY) {
-      process.stderr.write("Server is running. Press Ctrl+C to stop.\n");
+      logIfTest("Server is running. Press Ctrl+C to stop.\n");
     }
   }
 
@@ -2472,17 +2654,19 @@ export class DisperslMCPServer {
     // Close all MCP client connections
     for (const [name, client] of this.clients.entries()) {
       try {
-        await client.client.close();
-        console.log(`Closed connection to MCP client: ${name}`);
+        if (client.client && typeof (client.client as any).close === "function") {
+          await (client.client as any).close();
+        }
+        logIfTest(`Closed connection to MCP client: ${name}\n`);
       } catch (error) {
-        console.error(`Error closing MCP client ${name}:`, error);
+        logIfTest(`Error closing MCP client ${name}:`, error);
       }
     }
 
     // Clear sessions
     this.sessions.clear();
 
-    console.log("Dispersl MCP Server stopped");
+    logIfTest("Dispersl MCP Server stopped\n");
   }
 
   public async getTools(): Promise<Map<string, MCPTool>> {
@@ -2507,8 +2691,9 @@ export class DisperslMCPServer {
     return response.json();
   }
 
-  // NDJSON Streaming Helper (refactored)
-  private async *ndjsonStream(endpoint: string, args: any, session?: AgenticSession): AsyncGenerator<any, void, unknown> {
+  // Text Streaming Helper
+  private async *textStream(endpoint: string, args: any, session?: AgenticSession, log?: any): AsyncGenerator<any, void, unknown> {
+    logIfTest(`Calling NDJSON API endpoint: ${endpoint} ${JSON.stringify(args)}`);
     const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
       method: "POST",
       headers: {
@@ -2517,30 +2702,41 @@ export class DisperslMCPServer {
       },
       body: JSON.stringify(args)
     });
-    if (!response.body) throw new Error("No response body for NDJSON stream");
+    if (!response.body) {
+      logIfTest(`NDJSON API call failed: ${endpoint}. Error: No response body for NDJSON stream`);
+      throw new Error("No response body for NDJSON stream");
+    }
+    logIfTest(`NDJSON API call response: ${response.body.toString()}`);
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let done = false;
+    const done = false;
     let fullResponse = '';
-    while (!done) {
-      const { value, done: streamDone } = await reader.read();
-      if (streamDone) break;
-      buffer += decoder.decode(value, { stream: true });
-      let lines = buffer.split('\n');
-      buffer = lines.pop()!; // last line may be incomplete
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let data;
-        try {
-          data = JSON.parse(line);
-        } catch (e) {
-          continue; // skip malformed lines
+    try {
+      while (!done) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop()!; // last line may be incomplete
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let data;
+          try {
+            data = JSON.parse(line);
+          } catch (e) {
+            continue; // skip malformed lines
+          }
+          // Optionally accumulate content for session
+          if (data.content) fullResponse += data.content;
+          yield data;
         }
-        // Optionally accumulate content for session
-        if (data.content) fullResponse += data.content;
-        yield data;
       }
+      logIfTest(`NDJSON API call successful: ${response.body.toString()}`);
+    } catch (error) {
+      logIfTest(`NDJSON API call response failed: ${endpoint}. Error: ${error}`);
+      throw error;
     }
     // Optionally update session with final response
     if (session) {
@@ -2561,10 +2757,63 @@ export class DisperslMCPServer {
         timestamp: new Date().toISOString()
       });
     }
+  }  
+
+  // NDJSON Streaming Helper
+  private async *ndjsonStream(endpoint: string, args: any, session?: AgenticSession, log?: any): AsyncGenerator<any, void, unknown> {
+    logIfTest(`Calling NDJSON API endpoint: ${endpoint} ${JSON.stringify(args)}`);
+    const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(args)
+    });
+    if (!response.body) {
+      logIfTest(`NDJSON API call failed: ${endpoint}. Error: No response body for NDJSON stream`);
+      throw new Error("No response body for NDJSON stream");
+    }
+    logIfTest(`NDJSON API call response: ${response.body.toString()}`);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const done = false;
+    let fullResponse = '';
+    try {
+      while (!done) {
+        const { value, done: streamDone } = await reader.read();
+        if (streamDone) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop()!; // last line may be incomplete
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let data;
+          try {
+            data = JSON.parse(line);
+          } catch (e) {
+            continue; // skip malformed lines
+          }
+          // Optionally accumulate content for session
+          if (data.content) fullResponse += data.content;
+          yield data;
+        }
+      }
+      logIfTest(`NDJSON API call successful: ${response.body.toString()}`);
+    } catch (error) {
+      logIfTest(`NDJSON API call response failed: ${endpoint}. Error: ${error}`);
+      throw error;
+    }
+    // Note: Session updates are now handled in executeDisperslAgent method
+    // to properly manage conversation history across iterations
   }
 
   // Generic application/json endpoint helper
-  private async callJsonEndpoint(endpoint: string, method: string = "GET", body?: any): Promise<any> {
+  private async callJsonEndpoint(endpoint: string, method: string = "GET", body?: any, log?: any): Promise<any> {
+    logIfTest(`Calling API endpoint: ${endpoint} ${method} ${body}`);
+
     const response = await fetch(`${DISPERSL_API_BASE}${endpoint}`, {
       method,
       headers: {
@@ -2574,9 +2823,13 @@ export class DisperslMCPServer {
       body: body ? JSON.stringify(body) : undefined
     });
     if (!response.ok) {
-      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+      const text = await response.text();
+      logIfTest(`API call failed: ${endpoint} ${method}. Error: ${text}`);
+      throw new Error(`API call failed: ${response.status} ${response.statusText} - ${text}`);
     }
-    return response.json();
+    const result = await response.json();
+    logIfTest(`API call successful: ${endpoint} ${method} ${result}`);
+    return result;
   }
 }
 
@@ -2603,7 +2856,7 @@ export const imageContent = async (
 
     const mimeType = await fileTypeFromBuffer(rawData);
     if (!mimeType || !mimeType.mime.startsWith("image/")) {
-      console.warn(`Warning: Content may not be a valid image. Detected MIME: ${mimeType?.mime || "unknown"}`);
+      logIfTest(`Warning: Content may not be a valid image. Detected MIME: ${mimeType?.mime || "unknown"}`);
     }
 
     return {
@@ -2640,7 +2893,7 @@ export const audioContent = async (
 
     const mimeType = await fileTypeFromBuffer(rawData);
     if (!mimeType || !mimeType.mime.startsWith("audio/")) {
-      console.warn(`Warning: Content may not be a valid audio file. Detected MIME: ${mimeType?.mime || "unknown"}`);
+      logIfTest(`Warning: Content may not be a valid audio file. Detected MIME: ${mimeType?.mime || "unknown"}`);
     }
 
     return {
@@ -2673,19 +2926,19 @@ if (process.argv[1] && (process.argv[1].endsWith('server.js') || process.argv[1]
 
   // Setup graceful shutdown
   process.on('SIGINT', async () => {
-    console.log('Received SIGINT, shutting down gracefully...');
+    logIfTest('Received SIGINT, shutting down gracefully...');
     await server.stop();
     process.exit(0);
   });
 
   process.on('SIGTERM', async () => {
-    console.log('Received SIGTERM, shutting down gracefully...');
+    logIfTest('Received SIGTERM, shutting down gracefully...');
     await server.stop();
     process.exit(0);
   });
 
   server.start().catch((error) => {
-    console.error('Failed to start server:', error);
+    logIfTest('Failed to start server:', error);
     process.exit(1);
   });
 }

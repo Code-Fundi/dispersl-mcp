@@ -1,4 +1,4 @@
-export function bannerLogo() {
+export function bannerLogo(): void {
   console.log(`\n\x1b[36m
        ___                           __
   ____/ (_)________  ___  __________/ /

@@ -1,5 +1,3 @@
-import { z } from "zod";
-
 // Base interfaces
 export interface BaseRequest {
   model?: string;
@@ -164,7 +162,11 @@ export interface MCPTool {
   name: string;
   description: string;
   parameters: unknown;
-  execute: (args: unknown) => Promise<unknown>;
+  execute: (args: unknown, context?: { 
+    log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+    streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+    reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+  }) => Promise<unknown>;
   lastResponse?: {
     content?: string | Content[];
     error?: string;
@@ -210,7 +212,7 @@ export interface MCPClientConfig {
 
 export interface MCPClient {
   name: string;
-  client: any; // Replace with actual client type
+  client: unknown; // Replace with actual client type
   tools: Map<string, MCPTool>;
   executeTool: (toolName: string, args: unknown) => Promise<unknown>;
 }
