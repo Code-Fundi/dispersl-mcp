@@ -1,7 +1,15 @@
 {
-  "exports": "./src/FastMCP.ts",
-  "include": ["src/FastMCP.ts", "src/bin/fastmcp.ts"],
+  "name": "dispersl-mcp",
+  "version": "0.1.1",
+  "description": "MCP server for Dispersl",
   "license": "MIT",
-  "name": "@punkpeye/fastmcp",
-  "version": "1.0.0"
+  "exports": "./src/server.ts",
+  "include": [
+    "src/server.ts",
+    "src/bin/dispersl.ts"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Code-Fundi/dispersl-mcp.git"
+  }
 }

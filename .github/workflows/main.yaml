@@ -41,10 +41,20 @@ jobs:
         run: pnpm lint
       - name: Run tests
         run: pnpm test
+        env:
+          DISPERSL_API_KEY: ${{ secrets.DISPERSL_API_KEY }}
       - name: Build
         run: pnpm build
-      - name: Release
-        run: pnpm semantic-release
+  publish-npm:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          registry-url: https://registry.npmjs.org/
+      - run: npm install
+      - run: npm publish --provenance --access public
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{secrets.NPM_TOKEN}}
