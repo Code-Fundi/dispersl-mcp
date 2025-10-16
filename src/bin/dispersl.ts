@@ -71,6 +71,25 @@ async function main(): Promise<void> {
       }
     )
     .command(
+      "custom-agent <prompt>",
+      "Execute a custom agent and its tools",
+      (y: yargs.Argv) => y
+        .positional("name_id", { type: "string", describe: "Name ID of the agent to execute from the /agents endpoint" })
+        .positional("prompt", { type: "string", describe: "Prompt for agent to execute" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "dispersl_custom_agent");
+          const result = tool ? await tool.execute({ prompt: (argv as unknown as { prompt: string }).prompt }) : undefined;
+          console.log(successNotification("Agent execution completed"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Agent execution failed: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )    
+    .command(
       "build-code <prompt>",
       "Generate code from a prompt",
       (y: yargs.Argv) => y.positional("prompt", { type: "string", describe: "Prompt for code generation" }),
@@ -161,6 +180,151 @@ async function main(): Promise<void> {
           }
         } catch (err) {
           console.error(errorNotification("Session operation failed: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "tasks",
+      "List tasks with pagination",
+      (y: yargs.Argv) => y
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_tasks");
+          const args: any = {};
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Tasks retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get tasks: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "agents",
+      "List agents with pagination",
+      (y: yargs.Argv) => y
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_agents");
+          const args: any = {};
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Agents retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get agents: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "steps",
+      "List steps with pagination",
+      (y: yargs.Argv) => y
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_steps");
+          const args: any = {};
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Steps retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get steps: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "steps-by-task <task_id>",
+      "Get steps by task ID with pagination",
+      (y: yargs.Argv) => y
+        .positional("task_id", { type: "string", describe: "Task ID" })
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_steps_by_task");
+          const args: any = { id: (argv as unknown as { task_id: string }).task_id };
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Steps by task retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get steps by task: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "task-history <task_id>",
+      "Get task history with pagination",
+      (y: yargs.Argv) => y
+        .positional("task_id", { type: "string", describe: "Task ID" })
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" })
+        .option("limit", { type: "number", describe: "Legacy limit parameter (used if pagination not provided)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_task_history");
+          const args: any = { id: (argv as unknown as { task_id: string }).task_id };
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          if ((argv as unknown as { limit: number }).limit !== undefined) args.limit = (argv as unknown as { limit: number }).limit;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Task history retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get task history: " + (err instanceof Error ? err.message : String(err))));
+        }
+      }
+    )
+    .command(
+      "step-history <step_id>",
+      "Get step history with pagination",
+      (y: yargs.Argv) => y
+        .positional("step_id", { type: "string", describe: "Step ID" })
+        .option("page", { type: "number", describe: "Page number (default: 1)" })
+        .option("pageSize", { type: "number", describe: "Items per page (default: 20, max: 100)" })
+        .option("limit", { type: "number", describe: "Legacy limit parameter (used if pagination not provided)" }),
+      async (argv: yargs.Arguments) => {
+        if (!(argv as unknown as { silent: boolean }).silent) bannerLogo();
+        const server = new DisperslMCPServer(await getApiKey(argv));
+        try {
+          const tool = await getTool(server, "get_step_history");
+          const args: any = { id: (argv as unknown as { step_id: string }).step_id };
+          if ((argv as unknown as { page: number }).page !== undefined) args.page = (argv as unknown as { page: number }).page;
+          if ((argv as unknown as { pageSize: number }).pageSize !== undefined) args.pageSize = (argv as unknown as { pageSize: number }).pageSize;
+          if ((argv as unknown as { limit: number }).limit !== undefined) args.limit = (argv as unknown as { limit: number }).limit;
+          
+          const result = tool ? await tool.execute(args) : undefined;
+          console.log(successNotification("Step history retrieved"));
+          console.log((result && (result as { text?: string }).text) || result);
+        } catch (err) {
+          console.error(errorNotification("Failed to get step history: " + (err instanceof Error ? err.message : String(err))));
         }
       }
     )

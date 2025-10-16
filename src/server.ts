@@ -10,10 +10,11 @@ import { fileTypeFromBuffer } from "file-type";
 import { readFile, writeFile, readdir, stat, mkdir } from "fs/promises";
 import { fetch } from "undici";
 import { execa } from "execa";
-import { join, dirname } from "path";
+import { join, dirname, resolve } from "path";
 import {
   BaseRequest,
   BaseResponse,
+  CustomAgentRequest,
   BuildCodeRequest,
   BuildTestsRequest,
   ChatRequest,
@@ -75,6 +76,83 @@ function logIfTest(...args: any[]) {
   }
 }
 
+// Helper function to resolve paths relative to a base directory
+function resolvePath(path: string, baseDir?: string): string {
+  if (path.startsWith('/') || path.startsWith('\\') || /^[A-Za-z]:/.test(path)) {
+    // Absolute path, return as is
+    return path;
+  }
+  // Relative path, resolve against base directory or current working directory
+  const base = baseDir || process.cwd();
+  return resolve(base, path);
+}
+
+// Helper function to parse concatenated JSON objects
+function parseConcatenatedJSON(jsonString: string): any[] {
+  const results: any[] = [];
+  let braceCount = 0;
+  let startIndex = -1;
+  let inString = false;
+  let escapeNext = false;
+  
+  // Handle edge cases
+  if (!jsonString || typeof jsonString !== 'string') {
+    return results;
+  }
+  
+  for (let i = 0; i < jsonString.length; i++) {
+    const char = jsonString[i];
+    
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    
+    if (char === '\\') {
+      escapeNext = true;
+      continue;
+    }
+    
+    if (char === '"' && !escapeNext) {
+      inString = !inString;
+      continue;
+    }
+    
+    if (!inString) {
+      if (char === '{') {
+        if (braceCount === 0) {
+          startIndex = i;
+        }
+        braceCount++;
+      } else if (char === '}') {
+        braceCount--;
+        if (braceCount === 0 && startIndex !== -1) {
+          // We have a complete JSON object
+          const jsonObject = jsonString.substring(startIndex, i + 1);
+          try {
+            const parsed = JSON.parse(jsonObject);
+            results.push(parsed);
+          } catch (error) {
+            logIfTest(`Failed to parse JSON object at index ${startIndex}: ${jsonObject}`);
+            // Add as raw string if parsing fails
+            results.push({ raw: jsonObject });
+          }
+          startIndex = -1;
+        }
+      }
+    }
+  }
+  
+  // Log parsing results for debugging
+  if (results.length > 0) {
+    logIfTest(`Successfully parsed ${results.length} JSON objects from concatenated string`);
+  } else {
+    logIfTest(`No valid JSON objects found in concatenated string`);
+  }
+  
+  return results;
+}
+
 // Main Server Class
 export class DisperslMCPServer {
   private server: FastMCP;
@@ -129,9 +207,11 @@ export class DisperslMCPServer {
     // Plan Agent
     const planTool: MCPTool = {
       name: "dispersl_plan_agent",
-      description: "Multi-agent task dispersion using agentic execution (plan agent). Agent choices can either be use 'code', 'test', 'git', 'docs' as the agent choices",
+      description: "Multi-agent task dispersion using agentic execution (plan agent). Agent choices can either be use 'code', 'test', 'git', 'docs' as the agent choices. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
         model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
@@ -140,49 +220,81 @@ export class DisperslMCPServer {
         agent_choice: z.array(z.string()).nonempty(),
         mcp: z.record(z.unknown()).optional()
       }),
-      execute: async (args: unknown) => {
-        const req = args as ChatRequest; // Plan agent uses similar structure
+      execute: async (args: unknown, context?: { 
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
+        const req = args as ChatRequest;
         const sessionId = req.task_id || uuidv4();
+        
         if (!this.sessions.has(sessionId)) {
           this.sessions.set(sessionId, {
             id: sessionId,
             tools: new Map(),
-            context: {},
+            context: req.context ? { context: req.context } : {},
             conversation_history: [],
             active_tools: new Set()
           });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
         }
+        
         // Set default model if not provided
         if (!req.model && this.planModel) {
           req.model = this.planModel;
         }
+        
         const session = this.sessions.get(sessionId)!;
+        
+        // Add user message to conversation history
+        session.conversation_history.push({
+          role: "user",
+          content: req.prompt,
+          timestamp: new Date().toISOString()
+        });
+        
         try {
-          session.conversation_history.push({
-            role: "user",
-            content: req.prompt,
-            timestamp: new Date().toISOString()
-          });
-          // Use NDJSON streaming
-          const stream = this.ndjsonStream("/agent/plan", req, session);
-          let fullResponse = '';
-          for await (const chunk of stream) {
-            if (chunk.content) fullResponse += chunk.content;
-          }
+          // Create progress callback for streaming updates
+          const progressCallback = (message: string, data?: any) => {
+            context?.log?.info(message, data);
+            context?.streamContent?.({
+              type: "text",
+              text: message
+            });
+          };
+          
+          // Use executeDisperslAgent for full agentic execution
+          await this.executeDisperslAgent("/agent/plan", req, session, progressCallback);
+          
+          // Compile final response from session
+          const finalResponse = this.compileSessionResponses(session, "dispersl_plan_agent");
+          
           return {
             content: [
               {
                 type: "text",
-                text: fullResponse
+                text: finalResponse
               }
             ]
           };
         } catch (error) {
+          const errorMessage = `Error: ${error instanceof Error ? error.message : "Unknown error"}`;
+          session.conversation_history.push({
+            role: "assistant",
+            content: errorMessage,
+            timestamp: new Date().toISOString()
+          });
+          
           return {
             content: [
               {
                 type: "text",
-                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+                text: errorMessage
               }
             ]
           };
@@ -206,14 +318,128 @@ export class DisperslMCPServer {
         return JSON.stringify(result);
       }
     });
-    this.tools.set(planTool.name, planTool);    
+    this.tools.set(planTool.name, planTool);   
+    
+    // Agent
+    const customAgentTool: MCPTool = {
+      name: "dispersl_custom_agent",
+      description: "Generate code files and codebases based on a prompt using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
+      parameters: z.object({
+        name_id: z.string(),
+        prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
+        model: z.string().optional(),
+        context: z.array(z.string()).optional(),
+        task_id: z.string().optional(),
+        knowledge: z.array(z.string()).optional(),
+        mcp: z.record(z.unknown()).optional()
+      }),
+      execute: async (args: unknown, context?: {
+        log?: { info: (message: string, data?: any) => void; warn: (message: string, data?: any) => void; error: (message: string, data?: any) => void; debug: (message: string, data?: any) => void };
+        streamContent?: (content: { type: string; text: string } | { type: string; text: string }[]) => Promise<void>;
+        reportProgress?: (progress: { progress: number; total?: number }) => Promise<void>;
+      }) => {
+        const req = args as CustomAgentRequest;
+        const sessionId = req.task_id || uuidv4();
+
+        if (!this.sessions.has(sessionId)) {
+          this.sessions.set(sessionId, {
+            id: sessionId,
+            tools: new Map(),
+            context: req.context ? { context: req.context } : {},
+            conversation_history: [],
+            active_tools: new Set()
+          });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
+        }
+
+        // Set default model if not provided
+        if (!req.model && this.coderModel) {
+          req.model = this.coderModel;
+        }
+
+        const session = this.sessions.get(sessionId)!;
+
+        try {
+          // Stream initial status
+          context?.streamContent?.({
+            type: "text",
+            text: `🚀 Starting agentic execution loop for /agent\n\n`
+          });
+
+          // Use executeDisperslAgent for full agentic loop
+          await this.executeDisperslAgent("/agent", req, session, (message) => {
+            context?.streamContent?.({
+              type: "text",
+              text: message + "\n"
+            });
+          });
+          const toolName = "dispersl_custom_agent";
+          const sessionTool = session.tools.get(toolName);
+
+          // Compile all responses from the session
+          const compiledResponse = this.compileSessionResponses(session, "dispersl_custom_agent");
+
+          // Stream completion message
+          context?.streamContent?.({
+            type: "text",
+            text: `🎉 **Agentic execution completed!**\n\n`
+          });
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: compiledResponse || sessionTool?.lastResponse?.content || "Agent completed"
+              }
+            ]
+          };
+        } catch (error) {
+          logIfTest(`Agent error: ${error}`);
+          context?.log?.error("Agent failed", { error: error instanceof Error ? error.message : "Unknown error" });
+          context?.streamContent?.({
+            type: "text",
+            text: `❌ **Error:** ${error instanceof Error ? error.message : "Unknown error"}\n\n`
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`
+              }
+            ]
+          };
+        }
+      }
+    };
+    this.server.addTool({
+      name: customAgentTool.name,
+      description: customAgentTool.description,
+      parameters: customAgentTool.parameters as any,
+      execute: async (args: unknown, context: any) => {
+        const result = await customAgentTool.execute(args as CustomAgentRequest, context);
+
+        logIfTest(`TEST: ${result}`)
+
+        return JSON.stringify(result);
+      }
+    });
+    this.tools.set(customAgentTool.name, customAgentTool);     
 
     // Code Generation
     const buildCodeTool: MCPTool = {
       name: "dispersl_code_agent",
-      description: "Generate code files and codebases based on a prompt using agentic execution",
+      description: "Generate code files and codebases based on a prompt using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
         model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
@@ -232,10 +458,16 @@ export class DisperslMCPServer {
           this.sessions.set(sessionId, {
             id: sessionId,
             tools: new Map(),
-            context: {},
+            context: req.context ? { context: req.context } : {},
             conversation_history: [],
             active_tools: new Set()
           });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
         }
 
         // Set default model if not provided
@@ -314,9 +546,11 @@ export class DisperslMCPServer {
     // Test Generation
     const buildTestsTool: MCPTool = {
       name: "dispersl_testing_agent",
-      description: "Generate end to end tests based on a prompt using agentic execution",
+      description: "Generate end to end tests based on a prompt using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
         model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
@@ -334,10 +568,16 @@ export class DisperslMCPServer {
           this.sessions.set(sessionId, {
             id: sessionId,
             tools: new Map(),
-            context: {},
+            context: req.context ? { context: req.context } : {},
             conversation_history: [],
             active_tools: new Set()
           });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
         }
         // Set default model if not provided
         if (!req.model && this.testerModel) {
@@ -401,9 +641,11 @@ export class DisperslMCPServer {
     // Git Operations
     const gitOperationTool: MCPTool = {
       name: "dispersl_git_agent",
-      description: "Execute codebase versioning operations with Git based on a prompt using agentic execution",
+      description: "Execute codebase versioning operations with Git based on a prompt using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
         model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
@@ -421,10 +663,16 @@ export class DisperslMCPServer {
           this.sessions.set(sessionId, {
             id: sessionId,
             tools: new Map(),
-            context: {},
+            context: req.context ? { context: req.context } : {},
             conversation_history: [],
             active_tools: new Set()
           });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
         }
         // Set default model if not provided
         if (!req.model && this.gitModel) {
@@ -577,9 +825,11 @@ export class DisperslMCPServer {
     // Chat
     const chatTool: MCPTool = {
       name: "dispersl_chat_agent",
-      description: "Chat with the Dispersl agent to get knowledge or insights about codebases using agentic execution",
+      description: "Chat with the Dispersl agent to get knowledge or insights about codebases using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         prompt: z.string(),
+        default_dir: z.string(),
+        current_dir: z.string(),
         model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
@@ -595,10 +845,16 @@ export class DisperslMCPServer {
           this.sessions.set(sessionId, {
             id: sessionId,
             tools: new Map(),
-            context: {},
+            context: req.context ? { context: req.context } : {},
             conversation_history: [],
             active_tools: new Set()
           });
+        } else {
+          // Update existing session with additional context
+          const session = this.sessions.get(sessionId)!;
+          if (req.context) {
+            session.context.context = req.context;
+          }
         }
         // Set default model if not provided
         if (!req.model && this.chatModel) {
@@ -1036,11 +1292,20 @@ export class DisperslMCPServer {
 
     const getTasksTool: MCPTool = {
       name: "get_tasks",
-      description: "Get all tasks",
-      parameters: z.object({}),
-      execute: async () => {
+      description: "Get all tasks with pagination support",
+      parameters: z.object({
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)")
+      }),
+      execute: async (args: any) => {
         try {
-          const result = await this.callJsonEndpoint("/tasks", "GET");
+          const { page, pageSize } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/tasks${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const result = await this.callJsonEndpoint(endpoint, "GET");
           logIfTest("get_tasks API result:", result);
           return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
@@ -1078,6 +1343,61 @@ export class DisperslMCPServer {
       }) as any
     });
     this.tools.set(getTasksTool.name, getTasksTool);
+
+    // Agents
+    const getAgentsTool: MCPTool = {
+      name: "get_agents",
+      description: "Get all agents with pagination support",
+      parameters: z.object({
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)")
+      }),
+      execute: async (args: any) => {
+        try {
+          const { page, pageSize } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/agents${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const result = await this.callJsonEndpoint(endpoint, "GET");
+          logIfTest("get_agents API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
+        } catch (error) {
+          logIfTest("get_agents Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getAgentsTool.name,
+      description: getAgentsTool.description,
+      parameters: getAgentsTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getAgentsTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getAgentsTool.name, getAgentsTool);
 
     const getTaskTool: MCPTool = {
       name: "get_task",
@@ -1217,11 +1537,20 @@ export class DisperslMCPServer {
 
     const getStepsTool: MCPTool = {
       name: "get_steps",
-      description: "Get all steps",
-      parameters: z.object({}),
-      execute: async () => {
+      description: "Get all steps with pagination support",
+      parameters: z.object({
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)")
+      }),
+      execute: async (args: any) => {
         try {
-          const result = await this.callJsonEndpoint("/steps", "GET");
+          const { page, pageSize } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/steps${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const result = await this.callJsonEndpoint(endpoint, "GET");
           logIfTest("get_steps API result:", result);
           return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
@@ -1259,6 +1588,61 @@ export class DisperslMCPServer {
       }) as any
     });
     this.tools.set(getStepsTool.name, getStepsTool);
+
+    const getStepsByTaskTool: MCPTool = {
+      name: "get_steps_by_task",
+      description: "Get steps by task ID with pagination support",
+      parameters: z.object({
+        id: z.string().describe("Task ID"),
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)")
+      }),
+      execute: async (args: any) => {
+        try {
+          const { id, page, pageSize } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/steps/task/${id}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const result = await this.callJsonEndpoint(endpoint, "GET");
+          logIfTest("get_steps_by_task API result:", result);
+          return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
+        } catch (error) {
+          logIfTest("get_steps_by_task Error:", error);
+          return { content: [ { type: "text", text: `Error: ${error instanceof Error ? error.message : "Unknown error"}` } ] };
+        }
+      }
+    };
+    this.server.addTool({
+      name: getStepsByTaskTool.name,
+      description: getStepsByTaskTool.description,
+      parameters: getStepsByTaskTool.parameters as any,
+      execute: (async (args: unknown, _context: any) => {
+        const result = await getStepsByTaskTool.execute(args);
+        if (
+          result &&
+          typeof result === "object" &&
+          "type" in (result as any) &&
+          typeof (result as any).type === "string" &&
+          (result as any).type === "data"
+        ) {
+          return result;
+        } else if (typeof result === "string") return result;
+        if (
+          result &&
+          typeof result === "object" &&
+          "text" in (result as any)
+        ) {
+          if (!("type" in (result as any))) {
+            return { ...(result as any), type: "text" };
+          }
+          return result;
+        }
+        return result;
+      }) as any
+    });
+    this.tools.set(getStepsByTaskTool.name, getStepsByTaskTool);
 
     const getStepTool: MCPTool = {
       name: "get_step",
@@ -1489,11 +1873,23 @@ export class DisperslMCPServer {
     // History
     const getTaskHistoryTool: MCPTool = {
       name: "get_task_history",
-      description: "Get task history by ID",
-      parameters: z.object({ id: z.string(), body: z.object({}).passthrough().optional() }),
+      description: "Get task history by ID with pagination support",
+      parameters: z.object({ 
+        id: z.string().describe("Task ID"),
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)"),
+        limit: z.number().optional().describe("Legacy limit parameter (used if pagination not provided)")
+      }),
       execute: async (args: any) => {
         try {
-          const result = await this.callJsonEndpoint(`/history/${args.id}`, "GET", args.body);
+          const { id, page, pageSize, limit } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/history/task/${id}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const body = limit !== undefined ? { limit } : undefined;
+          const result = await this.callJsonEndpoint(endpoint, "GET", body);
           logIfTest("get_task_history API result:", result);
           return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
@@ -1534,11 +1930,23 @@ export class DisperslMCPServer {
 
     const getStepHistoryTool: MCPTool = {
       name: "get_step_history",
-      description: "Get step history by ID",
-      parameters: z.object({ id: z.string(), body: z.object({}).passthrough().optional() }),
+      description: "Get step history by ID with pagination support",
+      parameters: z.object({ 
+        id: z.string().describe("Step ID"),
+        page: z.number().optional().describe("Page number (default: 1)"),
+        pageSize: z.number().optional().describe("Items per page (default: 20, max: 100)"),
+        limit: z.number().optional().describe("Legacy limit parameter (used if pagination not provided)")
+      }),
       execute: async (args: any) => {
         try {
-          const result = await this.callJsonEndpoint(`/history/${args.id}/step`, "GET", args.body);
+          const { id, page, pageSize, limit } = args;
+          const queryParams = new URLSearchParams();
+          if (page !== undefined) queryParams.append('page', page.toString());
+          if (pageSize !== undefined) queryParams.append('pageSize', pageSize.toString());
+          
+          const endpoint = `/history/step/${id}${queryParams.toString() ? `?${queryParams.toString()}` : ''}`;
+          const body = limit !== undefined ? { limit } : undefined;
+          const result = await this.callJsonEndpoint(endpoint, "GET", body);
           logIfTest("get_step_history API result:", result);
           return { content: [ { type: "text", text: JSON.stringify(result, null, 2) } ] };
         } catch (error) {
@@ -1911,10 +2319,10 @@ export class DisperslMCPServer {
     this.updateMcpTools();
   }
 
-  private async executeMCPTool(toolName: string, args: unknown): Promise<any> {
+  private async executeMCPTool(toolName: string, args: unknown, session?: AgenticSession): Promise<any> {
     // First check if it's a built-in tool
     if (this.isBuiltInTool(toolName)) {
-      return this.executeBuiltInTool(toolName, args);
+      return this.executeBuiltInTool(toolName, args, session);
     }
 
     // Then check all connected MCP clients
@@ -2060,7 +2468,7 @@ export class DisperslMCPServer {
         // Process tool calls
         progressCallback?.("Processing tool calls");
         progressCallback?.(`⚙️ **Processing ${toolCalls.length} tool call(s)...**\n`);
-        const { responses: toolResponses, handover } = await this.processToolCalls(toolCalls, session);
+        const { responses: toolResponses, handover } = await this.processToolCalls(toolCalls, session, currentArgs.current_dir);
         progressCallback?.("Tool calls processed");
         progressCallback?.(`✅ **Tool calls processed:** ${toolResponses.length} response(s), Handover: ${handover ? 'Yes' : 'No'}\n`);
 
@@ -2190,7 +2598,8 @@ export class DisperslMCPServer {
 
   private async processToolCalls(
     toolCalls: ToolCall[],
-    session: AgenticSession
+    session: AgenticSession,
+    currentDir?: string
   ): Promise<{ responses: ToolResponse[], handover?: HandoverInfo }> {
     const toolResponses: ToolResponse[] = [];
     let handover: HandoverInfo | undefined = undefined;
@@ -2198,9 +2607,39 @@ export class DisperslMCPServer {
     for (const toolCall of toolCalls) {
       try {
         const functionName = toolCall.function.name;
-        const functionArgs = JSON.parse(toolCall.function.arguments);
+        let functionArgs: any;
+
+        // Try to parse arguments as regular JSON first
+        try {
+          functionArgs = JSON.parse(toolCall.function.arguments);
+        } catch (parseError) {
+          // If regular JSON parsing fails, try to parse as concatenated JSON
+          logIfTest(`[processToolCalls] Regular JSON parsing failed for ${functionName}, trying concatenated JSON parsing`);
+          logIfTest(`[processToolCalls] Arguments string: ${toolCall.function.arguments}`);
+          const parsedObjects = parseConcatenatedJSON(toolCall.function.arguments);
+          
+          if (parsedObjects.length === 0) {
+            throw new Error(`Failed to parse arguments as JSON or concatenated JSON: ${toolCall.function.arguments}`);
+          }
+          
+          // Use the first parsed object as the main arguments
+          functionArgs = parsedObjects[0];
+          
+          // If there are multiple objects, log them for debugging
+          if (parsedObjects.length > 1) {
+            logIfTest(`[processToolCalls] Found ${parsedObjects.length} concatenated JSON objects for ${functionName}`);
+            for (let i = 1; i < parsedObjects.length; i++) {
+              logIfTest(`[processToolCalls] Additional object ${i}: ${JSON.stringify(parsedObjects[i])}`);
+            }
+          }
+        }
 
         logIfTest(`[processToolCalls] Executing tool: ${functionName} with args: ${JSON.stringify(functionArgs)}`);
+
+        // Add current directory to built-in tool arguments if not already present
+        if (this.isBuiltInTool(functionName) && currentDir && !functionArgs.current_dir) {
+          functionArgs.current_dir = currentDir;
+        }
 
         // Handle special control tools
         if (functionName === "end_session") {
@@ -2253,7 +2692,7 @@ export class DisperslMCPServer {
         }
 
         // Execute the tool
-        const response = await this.executeMCPTool(functionName, functionArgs);
+        const response = await this.executeMCPTool(functionName, functionArgs, session);
 
         // Handle different response types
         let cleanedOutput: string;
@@ -2296,15 +2735,19 @@ export class DisperslMCPServer {
     return { responses: toolResponses, handover };
   }
 
-  private async executeBuiltInTool(functionName: string, functionArgs: any): Promise<BaseResponse> {
+  private async executeBuiltInTool(functionName: string, functionArgs: any, session?: AgenticSession): Promise<BaseResponse> {
+    // Get current directory from functionArgs or use process.cwd() as fallback
+    const currentDir = functionArgs.current_dir || process.cwd();
+    
     const builtInTools: Record<string, (args: any) => Promise<BaseResponse>> = {
       list_files: async (args) => {
         try {
-          const { path = "." } = args;
-          const entries = await readdir(path, { withFileTypes: true });
+          const { path = currentDir } = args;
+          const resolvedPath = resolvePath(path, currentDir);
+          const entries = await readdir(resolvedPath, { withFileTypes: true });
           const files = await Promise.all(
             entries.map(async (entry) => {
-              const stats = await stat(`${path}/${entry.name}`);
+              const stats = await stat(`${resolvedPath}/${entry.name}`);
               return {
                 name: entry.name,
                 type: entry.isDirectory() ? "directory" : "file",
@@ -2323,7 +2766,8 @@ export class DisperslMCPServer {
         try {
           const { path } = args;
           if (!path) throw new Error("Path is required");
-          const content = await readFile(path, "utf-8");
+          const resolvedPath = resolvePath(path, currentDir);
+          const content = await readFile(resolvedPath, "utf-8");
           return { status: "success", content };
         } catch (error) {
           return { status: "error", error: error instanceof Error ? error.message : "Failed to read file" };
@@ -2334,8 +2778,9 @@ export class DisperslMCPServer {
         try {
           const { path, content } = args;
           if (!path || content === undefined) throw new Error("Path and content are required");
-          await writeFile(path, content);
-          return { status: "success", content: `File written to ${path}` };
+          const resolvedPath = resolvePath(path, currentDir);
+          await writeFile(resolvedPath, content);
+          return { status: "success", content: `File written to ${resolvedPath}` };
         } catch (error) {
           return { status: "error", error: error instanceof Error ? error.message : "Failed to write file" };
         }
@@ -2345,8 +2790,9 @@ export class DisperslMCPServer {
         try {
           const { path, content } = args;
           if (!path || content === undefined) throw new Error("Path and content are required");
-          await writeFile(path, content);
-          return { status: "success", content: `File edited at ${path}` };
+          const resolvedPath = resolvePath(path, currentDir);
+          await writeFile(resolvedPath, content);
+          return { status: "success", content: `File edited at ${resolvedPath}` };
         } catch (error) {
           return { status: "error", error: error instanceof Error ? error.message : "Failed to edit file" };
         }
@@ -2365,13 +2811,14 @@ export class DisperslMCPServer {
 
       detect_test_frameworks: async (args) => {
         try {
-          const { path = "." } = args;
-          const entries = await readdir(path, { withFileTypes: true });
+          const { path = currentDir } = args;
+          const resolvedPath = resolvePath(path, currentDir);
+          const entries = await readdir(resolvedPath, { withFileTypes: true });
           const frameworks = new Set<string>();
           const configFiles = new Set<string>();
 
           try {
-            const packageJson = JSON.parse(await readFile(`${path}/package.json`, "utf-8"));
+            const packageJson = JSON.parse(await readFile(`${resolvedPath}/package.json`, "utf-8"));
             const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
             if (deps.jest) frameworks.add("jest");
             if (deps.mocha) frameworks.add("mocha");
@@ -2405,8 +2852,9 @@ export class DisperslMCPServer {
         try {
           const { path, content } = args;
           if (!path || content === undefined) throw new Error("Path and content are required");
-          await writeFile(path, content);
-          return { status: "success", content: `Test file written to ${path}` };
+          const resolvedPath = resolvePath(path, currentDir);
+          await writeFile(resolvedPath, content);
+          return { status: "success", content: `Test file written to ${resolvedPath}` };
         } catch (error) {
           return { status: "error", error: error instanceof Error ? error.message : "Failed to write test file" };
         }
@@ -2514,8 +2962,9 @@ export class DisperslMCPServer {
         try {
           const { path, content } = args;
           if (!path || content === undefined) throw new Error("Path and content are required");
-          await writeFile(path, content);
-          return { status: "success", content: `Git infrastructure file written to ${path}` };
+          const resolvedPath = resolvePath(path, currentDir);
+          await writeFile(resolvedPath, content);
+          return { status: "success", content: `Git infrastructure file written to ${resolvedPath}` };
         } catch (error) {
           return { status: "error", error: error instanceof Error ? error.message : "Failed to edit git infrastructure file" };
         }

@@ -1,12 +1,12 @@
 // Base interfaces
 export interface BaseRequest {
   model?: string;
-  context?: string;
+  context?: string; // Additional context such as code, conversation context, etc.
   task_id?: string;
   knowledge?: string;
   os?: string;
-  default_dir?: string;
-  current_dir?: string;
+  default_dir?: string; // Project root directory
+  current_dir?: string; // Subdirectory being worked on (defaults to project dir if no subdirectory is specified)
   mcp?: Record<string, unknown>;
 }
 
@@ -33,8 +33,23 @@ export interface ModelsResponse {
 }
 
 // Code Generation & Development
+export interface CustomAgentRequest extends BaseRequest {
+  prompt: string;
+  default_dir: string;
+  current_dir: string;
+}
+
+export interface CustomAgentResponse {
+  status: "success" | "error";
+  content: string;
+  error?: string;
+}
+
+// Code Generation & Development
 export interface BuildCodeRequest extends BaseRequest {
   prompt: string;
+  default_dir: string;
+  current_dir: string;
 }
 
 export interface BuildCodeResponse {
@@ -46,6 +61,8 @@ export interface BuildCodeResponse {
 // Testing
 export interface BuildTestsRequest extends BaseRequest {
   prompt: string;
+  default_dir: string;
+  current_dir: string;
 }
 
 export interface BuildTestsResponse {
@@ -57,6 +74,8 @@ export interface BuildTestsResponse {
 // Git Operations
 export interface GitOperationRequest extends BaseRequest {
   prompt: string;
+  default_dir: string;
+  current_dir: string;
 }
 
 export interface GitOperationResponse {
@@ -87,6 +106,8 @@ export interface BuildDocsRequest extends BaseRequest {
 // Chat & Conversation
 export interface ChatRequest extends BaseRequest {
   prompt: string;
+  default_dir: string;
+  current_dir: string;
   memory?: boolean;
   voice?: boolean;
 }

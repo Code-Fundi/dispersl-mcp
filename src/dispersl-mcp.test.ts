@@ -56,6 +56,185 @@ describe("DisperslMCPServer", () => {
     });
   });
 
+  describe("Pagination", () => {
+    it("should get tasks with pagination", async () => {
+      const response = await client.callTool({
+        name: "get_tasks",
+        arguments: {
+          page: 1,
+          pageSize: 10
+        }
+      });
+
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      const result = JSON.parse(response.text);
+      expect(result.status).toBe("success");
+      expect(result.data).toBeDefined();
+      expect(Array.isArray(result.data)).toBe(true);
+      expect(result.pagination).toBeDefined();
+      expect(result.pagination.page).toBe(1);
+      expect(result.pagination.pageSize).toBe(10);
+      expect(result.pagination.total).toBeDefined();
+      expect(result.pagination.totalPages).toBeDefined();
+      expect(result.pagination.hasNext).toBeDefined();
+      expect(result.pagination.hasPrev).toBeDefined();
+    });
+
+    it("should get agents with pagination", async () => {
+      const response = await client.callTool({
+        name: "get_agents",
+        arguments: {
+          page: 1,
+          pageSize: 5
+        }
+      });
+
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      const result = JSON.parse(response.text);
+      expect(result.status).toBe("success");
+      expect(result.data).toBeDefined();
+      expect(Array.isArray(result.data)).toBe(true);
+      expect(result.pagination).toBeDefined();
+      expect(result.pagination.page).toBe(1);
+      expect(result.pagination.pageSize).toBe(5);
+    });
+
+    it("should get steps with pagination", async () => {
+      const response = await client.callTool({
+        name: "get_steps",
+        arguments: {
+          page: 1,
+          pageSize: 15
+        }
+      });
+
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      const result = JSON.parse(response.text);
+      expect(result.status).toBe("success");
+      expect(result.data).toBeDefined();
+      expect(Array.isArray(result.data)).toBe(true);
+      expect(result.pagination).toBeDefined();
+      expect(result.pagination.page).toBe(1);
+      expect(result.pagination.pageSize).toBe(15);
+    });
+
+    it("should get steps by task with pagination", async () => {
+      // First get a task to use its ID
+      const tasksResponse = await client.callTool({
+        name: "get_tasks",
+        arguments: { page: 1, pageSize: 1 }
+      });
+      
+      const tasksResult = JSON.parse(tasksResponse.text);
+      if (tasksResult.data && tasksResult.data.length > 0) {
+        const taskId = tasksResult.data[0].id;
+        
+        const response = await client.callTool({
+          name: "get_steps_by_task",
+          arguments: {
+            id: taskId,
+            page: 1,
+            pageSize: 10
+          }
+        });
+
+        expect(response.type).toBe("text");
+        expect(response.text).toBeDefined();
+        const result = JSON.parse(response.text);
+        expect(result.status).toBe("success");
+        expect(result.data).toBeDefined();
+        expect(Array.isArray(result.data)).toBe(true);
+        expect(result.pagination).toBeDefined();
+        expect(result.pagination.page).toBe(1);
+        expect(result.pagination.pageSize).toBe(10);
+      }
+    });
+
+    it("should get task history with pagination", async () => {
+      // First get a task to use its ID
+      const tasksResponse = await client.callTool({
+        name: "get_tasks",
+        arguments: { page: 1, pageSize: 1 }
+      });
+      
+      const tasksResult = JSON.parse(tasksResponse.text);
+      if (tasksResult.data && tasksResult.data.length > 0) {
+        const taskId = tasksResult.data[0].id;
+        
+        const response = await client.callTool({
+          name: "get_task_history",
+          arguments: {
+            id: taskId,
+            page: 1,
+            pageSize: 10
+          }
+        });
+
+        expect(response.type).toBe("text");
+        expect(response.text).toBeDefined();
+        const result = JSON.parse(response.text);
+        expect(result.status).toBe("success");
+        expect(result.data).toBeDefined();
+        expect(Array.isArray(result.data)).toBe(true);
+        expect(result.pagination).toBeDefined();
+        expect(result.pagination.page).toBe(1);
+        expect(result.pagination.pageSize).toBe(10);
+      }
+    });
+
+    it("should get step history with pagination", async () => {
+      // First get a step to use its ID
+      const stepsResponse = await client.callTool({
+        name: "get_steps",
+        arguments: { page: 1, pageSize: 1 }
+      });
+      
+      const stepsResult = JSON.parse(stepsResponse.text);
+      if (stepsResult.data && stepsResult.data.length > 0) {
+        const stepId = stepsResult.data[0].id;
+        
+        const response = await client.callTool({
+          name: "get_step_history",
+          arguments: {
+            id: stepId,
+            page: 1,
+            pageSize: 10
+          }
+        });
+
+        expect(response.type).toBe("text");
+        expect(response.text).toBeDefined();
+        const result = JSON.parse(response.text);
+        expect(result.status).toBe("success");
+        expect(result.data).toBeDefined();
+        expect(Array.isArray(result.data)).toBe(true);
+        expect(result.pagination).toBeDefined();
+        expect(result.pagination.page).toBe(1);
+        expect(result.pagination.pageSize).toBe(10);
+      }
+    });
+
+    it("should handle pagination without parameters (use defaults)", async () => {
+      const response = await client.callTool({
+        name: "get_tasks",
+        arguments: {}
+      });
+
+      expect(response.type).toBe("text");
+      expect(response.text).toBeDefined();
+      const result = JSON.parse(response.text);
+      expect(result.status).toBe("success");
+      expect(result.data).toBeDefined();
+      expect(Array.isArray(result.data)).toBe(true);
+      expect(result.pagination).toBeDefined();
+      expect(result.pagination.page).toBe(1);
+      expect(result.pagination.pageSize).toBe(20); // Default page size
+    });
+  });
+
   describe("Code Generation", () => {
     it("should generate code based on a prompt", async () => {
       const response = await client.callTool({
