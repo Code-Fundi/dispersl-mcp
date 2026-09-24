@@ -94,6 +94,8 @@ export DISPERSL_TEST_MODEL=anthropic/claude-sonnet-4
 export DISPERSL_GIT_MODEL=meta-llama/llama-4-maverick:free
 export DISPERSL_DOCS_MODEL=openai/gpt-4o-mini
 export DISPERSL_CHAT_MODEL=openai/gpt-4o-mini
+export DISPERSL_SYSTEM_ONE_MODEL=typesafe/jev-1.13
+export DISPERSL_API_URL=https://api.dispersl.com/v1
 ```
 
 ---

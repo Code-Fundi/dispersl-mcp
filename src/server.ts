@@ -35,6 +35,12 @@ import { v4 as uuidv4 } from "uuid";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { ZodType } from "zod";
 import { EventSource } from "eventsource";
+import {
+  formatSessionTools,
+  handoverTarget,
+  normalizeIncomingTool,
+  prepareDisperslRequestBody,
+} from "./systemOne.js";
 
 const execAsync = async (command: string, args?: string[]) => {
   const { stdout, stderr } = await execa(command, args);
@@ -43,7 +49,8 @@ const execAsync = async (command: string, args?: string[]) => {
 
 // API Configuration
 const test = true;
-const DISPERSL_API_BASE = test ? "http://localhost:3001/v1" : "https://api.dispersl.com/v1";
+const DISPERSL_API_BASE = process.env.DISPERSL_API_URL
+  || (test ? "http://localhost:3001/v1" : "https://api.dispersl.com/v1");
 
 // Interface for a tool call received from the Dispersl API
 interface ToolCall {
@@ -168,6 +175,7 @@ export class DisperslMCPServer {
   private testerModel?: string | null;
   private gitModel?: string | null;
   private docsModel?: string | null;
+  private systemOneModel?: string | null;
   private mcpTools: Array<{ name: string; description: string; parameters: any }> = [];
 
   constructor(apiKey?: string) {
@@ -181,10 +189,11 @@ export class DisperslMCPServer {
     this.testerModel = process.env.DISPERSL_TEST_MODEL || null;
     this.gitModel = process.env.DISPERSL_GIT_MODEL || null;
     this.docsModel = process.env.DISPERSL_DOCS_MODEL || null;
+    this.systemOneModel = process.env.DISPERSL_SYSTEM_ONE_MODEL || null;
 
     this.server = new FastMCP({
       name: "dispersl-mcp",
-      version: "0.1.1",
+      version: "0.1.2",
       instructions: "I am an MCP server that can act as both a server and client. I can connect to other MCP servers and execute their tools in agentic loops.",
       health: {
         enabled: true,
@@ -326,10 +335,17 @@ export class DisperslMCPServer {
       description: "Generate code files and codebases based on a prompt using agentic execution. default_dir is the project root directory, current_dir is the subdirectory being worked on (defaults to project dir if no subdirectory is specified).",
       parameters: z.object({
         name_id: z.string(),
-        prompt: z.string(),
+        prompt: z.union([
+          z.string(),
+          z.object({
+            state: z.unknown(),
+            questions: z.record(z.any())
+          })
+        ]),
         default_dir: z.string(),
         current_dir: z.string(),
         model: z.string().optional(),
+        agent_model: z.string().optional(),
         context: z.array(z.string()).optional(),
         task_id: z.string().optional(),
         knowledge: z.array(z.string()).optional(),
@@ -359,10 +375,7 @@ export class DisperslMCPServer {
           }
         }
 
-        // Set default model if not provided
-        if (!req.model && this.coderModel) {
-          req.model = this.coderModel;
-        }
+        req.model = req.agent_model || req.model || this.systemOneModel || this.coderModel || undefined;
 
         const session = this.sessions.get(sessionId)!;
 
@@ -374,7 +387,7 @@ export class DisperslMCPServer {
           });
 
           // Use executeDisperslAgent for full agentic loop
-          await this.executeDisperslAgent("/agent", req, session, (message) => {
+          await this.executeDisperslAgent("/agent/completion", req, session, (message) => {
             context?.streamContent?.({
               type: "text",
               text: message + "\n"
@@ -2391,7 +2404,7 @@ export class DisperslMCPServer {
 
   private async executeDisperslAgent(
     endpoint: string,
-    args: BaseRequest & { prompt?: string; url?: string },
+    args: BaseRequest & { prompt?: string | { state: unknown; questions: Record<string, unknown> }; url?: string; name_id?: string; agent_model?: string },
     session: AgenticSession,
     progressCallback?: (message: string, data?: any) => void
   ): Promise<void> {
@@ -2406,25 +2419,35 @@ export class DisperslMCPServer {
       logIfTest(`Starting iteration ${iteration + 1}/${maxIterations}`);
       
       try {
-        // Use up-to-date mcpTools
         const mcpTools = this.mcpTools;
+        const { endpoint: requestEndpoint, body: requestBody } = prepareDisperslRequestBody(
+          currentEndpoint,
+          { ...currentArgs, mcp: { tools: mcpTools } } as Record<string, unknown>,
+          this.planModel
+        );
+        currentEndpoint = requestEndpoint;
 
-        // Make streaming API call using ndjsonStream
         logIfTest(`Making API call to dispersl endpoint: ${currentEndpoint}`);
-        const stream = this.ndjsonStream(currentEndpoint, {
-          ...currentArgs,
-          mcp: { tools: mcpTools }
-        }, session);
+        const stream = this.ndjsonStream(currentEndpoint, requestBody, session);
 
         let fullResponse = '';
         const toolCalls: ToolCall[] = [];
         let hasContentChunks = false;
         let hasStructuredResponse = false;
+        let capturedSystemOne = false;
 
-        // Collect streaming response
         logIfTest("Starting to collect streaming response");
         
         for await (const chunk of stream) {
+          if (chunk.error && chunk.status === 'error') {
+            throw new Error(chunk.error.message || chunk.message || "Dispersl stream error");
+          }
+          if (chunk.system_one && !capturedSystemOne) {
+            capturedSystemOne = true;
+            fullResponse += JSON.stringify(chunk.system_one.answers ?? chunk.system_one);
+            hasContentChunks = true;
+            logIfTest(`[Stream] System-one answers: ${JSON.stringify(chunk.system_one.answers ?? {})}`);
+          }
           if (chunk.content) {
             fullResponse += chunk.content;
             hasContentChunks = true;
@@ -2465,6 +2488,14 @@ export class DisperslMCPServer {
         // Note: ndjsonStream already updates session.conversation_history with the final response
         // The stream has already been consumed, so we don't need to await it again
 
+        if (fullResponse) {
+          session.conversation_history.push({
+            role: "assistant",
+            content: fullResponse,
+            timestamp: new Date().toISOString()
+          });
+        }
+
         // Process tool calls
         progressCallback?.("Processing tool calls");
         progressCallback?.(`⚙️ **Processing ${toolCalls.length} tool call(s)...**\n`);
@@ -2482,12 +2513,12 @@ export class DisperslMCPServer {
           execute: async () => ({ content: fullResponse, tools: toolCalls }),
           lastResponse: { 
             content: fullResponse, 
-            tools: toolCalls.map(toolCall => ({
-              name: toolCall.function.name,
-              arguments: JSON.parse(toolCall.function.arguments)
-            }))
+            tools: formatSessionTools(toolCalls as unknown as Array<Record<string, unknown>>)
           }
         });
+        if (currentEndpoint === "/agent/completion") {
+          session.tools.set("dispersl_custom_agent", session.tools.get(toolName)!);
+        }
 
         // If no tool calls or session ended, break the loop
         if (toolResponses.length === 0 || toolResponses.some(r => r.tool === 'end_session')) {
@@ -2604,9 +2635,11 @@ export class DisperslMCPServer {
     const toolResponses: ToolResponse[] = [];
     let handover: HandoverInfo | undefined = undefined;
 
-    for (const toolCall of toolCalls) {
+    for (const rawToolCall of toolCalls) {
+      let functionName = "unknown";
       try {
-        const functionName = toolCall.function.name;
+        const toolCall = normalizeIncomingTool(rawToolCall);
+        functionName = toolCall.function.name;
         let functionArgs: any;
 
         // Try to parse arguments as regular JSON first
@@ -2656,32 +2689,9 @@ export class DisperslMCPServer {
         if (functionName === "handover_task") {
           const handoverContent = functionArgs;
           const { agent_name, prompt, ...additionalArgs } = handoverContent;
-
-          let endpoint = '';
-          switch (agent_name) {
-            case "code":
-              endpoint = '/agent/code';
-              break;
-            case "test":
-              endpoint = '/agent/tests';
-              break;
-            case "git":
-              endpoint = '/agent/git';
-              break;
-            case "docs":
-              endpoint = '/docs/repo';
-              break;
-            case "chat":
-              endpoint = '/agent/chat';
-              break;
-            case "plan":
-              endpoint = '/agent/plan';
-              break;
-            default:
-              throw new Error(`Unknown agent for handover: ${agent_name}`);
-          }
-
-          handover = { endpoint, prompt, additionalArgs };
+          const target = handoverTarget(String(agent_name));
+          const endpoint = target.endpoint;
+          handover = { endpoint, prompt, additionalArgs: { ...additionalArgs, ...target.additionalArgs } };
           toolResponses.push({
             status: "SUCCESS",
             message: `Task handed over to ${agent_name} at ${endpoint}`,
@@ -2722,11 +2732,11 @@ export class DisperslMCPServer {
 
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error";
-        logIfTest(`[processToolCalls] Tool execution error for ${toolCall.function.name}: ${errorMessage}`);
+        logIfTest(`[processToolCalls] Tool execution error for ${functionName}: ${errorMessage}`);
         toolResponses.push({
           status: "FAILURE",
           message: `Error executing tool: ${errorMessage}`,
-          tool: toolCall.function.name,
+          tool: functionName,
           output: ""
         });
       }
@@ -3219,6 +3229,11 @@ export class DisperslMCPServer {
       },
       body: JSON.stringify(args)
     });
+    if (!response.ok) {
+      const text = await response.text();
+      logIfTest(`NDJSON API call failed: ${endpoint}. Error: ${text}`);
+      throw new Error(`API call failed: ${response.status} ${response.statusText} - ${text}`);
+    }
     if (!response.body) {
       logIfTest(`NDJSON API call failed: ${endpoint}. Error: No response body for NDJSON stream`);
       throw new Error("No response body for NDJSON stream");
