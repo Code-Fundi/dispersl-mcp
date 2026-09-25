@@ -193,7 +193,7 @@ export class DisperslMCPServer {
 
     this.server = new FastMCP({
       name: "dispersl-mcp",
-      version: "0.1.2",
+      version: "0.1.3",
       instructions: "I am an MCP server that can act as both a server and client. I can connect to other MCP servers and execute their tools in agentic loops.",
       health: {
         enabled: true,

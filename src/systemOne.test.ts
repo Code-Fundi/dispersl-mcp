@@ -29,7 +29,7 @@ describe("system-one mcp helpers", () => {
     expect(resolveSystemOnePrompt("typesafe/jev-1.13", prompt)).toEqual(prompt);
   });
 
-  it("does not wrap langage prompts", () => {
+  it("does not wrap language prompts", () => {
     expect(resolveSystemOnePrompt("stealth/ox-alpha", "write tests")).toBe("write tests");
   });
 
