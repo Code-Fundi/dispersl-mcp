@@ -34,7 +34,9 @@ export interface ModelsResponse {
 
 // Code Generation & Development
 export interface CustomAgentRequest extends BaseRequest {
-  prompt: string;
+  name_id?: string;
+  prompt: string | { state: unknown; questions: Record<string, unknown> };
+  agent_model?: string;
   default_dir: string;
   current_dir: string;
 }
